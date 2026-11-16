@@ -47,8 +47,8 @@ if [[ -f "$PIDFILE" ]]; then
     ok "PID file cleaned up."
 else
     info "No .cluster-pids file found."
-    step "Trying to find java processes (mini-distributed-db)..."
-    pkill -f "mini-distributed-db" 2>/dev/null && ok "Killed java processes." || info "No matching java processes."
+    step "Trying to find java processes (chronos / mini-distributed-db)..."
+    { pkill -f "chronos-1.0.0-SNAPSHOT" 2>/dev/null || pkill -f "mini-distributed-db" 2>/dev/null; } && ok "Killed java processes." || info "No matching java processes."
 fi
 
 # ── Kill dev servers (dashboard + demo app) ─────────────

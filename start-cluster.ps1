@@ -38,7 +38,7 @@ $ErrorActionPreference = "Stop"
 $ROOT = $PSScriptRoot
 $BACKEND = Join-Path $ROOT "backend"
 $FRONTEND = Join-Path $ROOT "frontend"
-$JAR = Join-Path $BACKEND "target\mini-distributed-db-1.0.0-SNAPSHOT-boot.jar"
+$JAR = Join-Path $BACKEND "target\chronos-1.0.0-SNAPSHOT-boot.jar"
 $LOGS = Join-Path $ROOT "logs"
 $PIDFILE = Join-Path $ROOT ".cluster-pids"
 

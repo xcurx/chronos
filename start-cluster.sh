@@ -12,10 +12,44 @@
 
 set -euo pipefail
 
+# Ensure Java 21+ and local Maven are configured and in PATH
+NEED_JDK_OVERRIDE=false
+if [[ -z "${JAVA_HOME:-}" ]]; then
+    NEED_JDK_OVERRIDE=true
+else
+    if [[ -x "${JAVA_HOME}/bin/java" ]]; then
+        CURRENT_JAVA_VER=$("${JAVA_HOME}/bin/java" -version 2>&1 | awk -F '"' '/version/ {print $2}' | awk -F. '{print $1}')
+        if [[ -n "$CURRENT_JAVA_VER" && "$CURRENT_JAVA_VER" -lt 21 ]]; then
+            NEED_JDK_OVERRIDE=true
+        fi
+    else
+        NEED_JDK_OVERRIDE=true
+    fi
+fi
+
+if [[ "$NEED_JDK_OVERRIDE" == true ]]; then
+    if [[ -d "/usr/lib/jvm/java-27-openjdk" ]]; then
+        export JAVA_HOME="/usr/lib/jvm/java-27-openjdk"
+    elif [[ -d "/usr/lib/jvm/default" ]]; then
+        export JAVA_HOME="/usr/lib/jvm/default"
+    fi
+fi
+
+if [[ -n "${JAVA_HOME:-}" ]]; then
+    export PATH="${JAVA_HOME}/bin:$HOME/.local/bin:$PATH"
+else
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+MVN_BIN="mvn"
+if ! command -v mvn &>/dev/null && [[ -x "$HOME/.local/bin/mvn" ]]; then
+    MVN_BIN="$HOME/.local/bin/mvn"
+fi
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BACKEND="$ROOT/backend"
 FRONTEND="$ROOT/frontend"
-JAR="$BACKEND/target/mini-distributed-db-1.0.0-SNAPSHOT-boot.jar"
+JAR="$BACKEND/target/chronos-1.0.0-SNAPSHOT-boot.jar"
 LOGS="$ROOT/logs"
 PIDFILE="$ROOT/.cluster-pids"
 
@@ -111,9 +145,9 @@ fi
 
 # ── Step 1: Build ───────────────────────────────────────
 if [[ "$SKIP_BUILD" == false ]]; then
-    step "Building backend (Maven)..."
+    step "Building backend (Maven with JDK ${CURRENT_JAVA_VER:-27})..."
     cd "$BACKEND"
-    mvn clean package -DskipTests -q
+    "$MVN_BIN" clean package -DskipTests -q
     cd "$ROOT"
     ok "Backend built successfully."
 else
@@ -141,10 +175,11 @@ for (( i=1; i<=NODES; i++ )); do
     GRPC_SERVER_PORT=$GP \
     NODE_ID=$NID \
     CLUSTER_PEERS="$PEERS" \
-        java -jar "$JAR" \
-            > "$LOGS/$NID.log" 2>"$LOGS/$NID-error.log" &
+        setsid java -jar "$JAR" \
+            > "$LOGS/$NID.log" 2>"$LOGS/$NID-error.log" < /dev/null &
 
     PID=$!
+    disown "$PID" 2>/dev/null || true
     echo "$PID" >> "$PIDFILE"
     ok "$NID  HTTP: $HP  gRPC: $GP  PID: $PID"
 done
@@ -159,8 +194,9 @@ if [[ "$SKIP_FRONTEND" == false ]]; then
         npm install --silent 2>/dev/null
     fi
 
-    npm run dev > "$LOGS/frontend.log" 2>"$LOGS/frontend-error.log" &
+    setsid npm run dev > "$LOGS/frontend.log" 2>"$LOGS/frontend-error.log" < /dev/null &
     FPID=$!
+    disown "$FPID" 2>/dev/null || true
     echo "$FPID" >> "$PIDFILE"
     cd "$ROOT"
     ok "Dashboard starting...  PID: $FPID"
