@@ -135,12 +135,22 @@ public class KvController {
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            Boolean committed = raftNode.submitPut(key, value.getBytes(StandardCharsets.UTF_8))
+            RaftNode.ChronosWriteResult writeResult = raftNode.submitPutWithResult(
+                            key, value.getBytes(StandardCharsets.UTF_8))
                     .get(5, java.util.concurrent.TimeUnit.SECONDS);
 
+            boolean committed = writeResult != null && writeResult.committed();
             long latency = System.currentTimeMillis() - start;
             result.put("success", committed);
             result.put("latencyMs", latency);
+            if (committed) {
+                result.put("versionId", writeResult.versionId());
+                result.put("versionSequence", writeResult.versionSequence());
+                result.put("timestamp", writeResult.timestamp());
+                result.put("branchId", writeResult.branchId());
+            } else if (writeResult != null && writeResult.error() != null) {
+                result.put("error", writeResult.error());
+            }
             eventBus.publish(ClusterEvent.kvOperation("PUT", key, latency, committed));
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - start;
@@ -208,6 +218,9 @@ public class KvController {
         if (specResult.success()) {
             result.put("timestamp", specResult.timestamp());
             result.put("raftLogIndex", specResult.raftLogIndex());
+            if (specResult.versionId() != null) {
+                result.put("versionId", specResult.versionId());
+            }
         } else {
             result.put("error", specResult.error());
         }
@@ -242,6 +255,9 @@ public class KvController {
         if (specResult.success()) {
             result.put("timestamp", specResult.timestamp());
             result.put("raftLogIndex", specResult.raftLogIndex());
+            if (specResult.versionId() != null) {
+                result.put("versionId", specResult.versionId());
+            }
         } else {
             result.put("error", specResult.error());
         }
@@ -343,12 +359,21 @@ public class KvController {
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            Boolean committed = raftNode.submitDelete(key)
+            RaftNode.ChronosWriteResult writeResult = raftNode.submitDeleteWithResult(key)
                     .get(5, java.util.concurrent.TimeUnit.SECONDS);
 
+            boolean committed = writeResult != null && writeResult.committed();
             long latency = System.currentTimeMillis() - start;
             result.put("success", committed);
             result.put("latencyMs", latency);
+            if (committed) {
+                result.put("versionId", writeResult.versionId());
+                result.put("versionSequence", writeResult.versionSequence());
+                result.put("timestamp", writeResult.timestamp());
+                result.put("branchId", writeResult.branchId());
+            } else if (writeResult != null && writeResult.error() != null) {
+                result.put("error", writeResult.error());
+            }
             eventBus.publish(ClusterEvent.kvOperation("DELETE", key, latency, committed));
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - start;
@@ -370,11 +395,14 @@ public class KvController {
                 ((Number) request.get("limit")).intValue() : 100;
         long timestamp = request.containsKey("timestamp") ?
                 ((Number) request.get("timestamp")).longValue() : 0L;
+        String readModeStr = String.valueOf(request.getOrDefault("readMode", "LINEARIZABLE"));
+        ReadMode readMode = "SPECULATIVE".equalsIgnoreCase(readModeStr)
+                ? ReadMode.SPECULATIVE : ReadMode.LINEARIZABLE;
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             List<MvccStore.MvccResult> results = raftNode.getMvccStore()
-                    .scan(startKey, endKey, limit, timestamp);
+                    .scan(startKey, endKey, limit, timestamp, readMode);
 
             List<Map<String, Object>> pairs = new ArrayList<>();
             for (MvccStore.MvccResult r : results) {
@@ -424,35 +452,61 @@ public class KvController {
 
     @PostMapping("/txn")
     public Map<String, Object> executeTransaction(@RequestBody Map<String, Object> request) {
+        if (!raftNode.isLeader()) {
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                return forwardToLeader("/api/kv/txn", mapper.writeValueAsString(request));
+            } catch (Exception e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("success", false);
+                err.put("error", "Forward failed: " + e.getMessage());
+                return err;
+            }
+        }
+
         long start = System.currentTimeMillis();
         Map<String, Object> result = new LinkedHashMap<>();
 
         try {
             @SuppressWarnings("unchecked")
-            List<Map<String, String>> ops = (List<Map<String, String>>) request.get("operations");
+            List<Map<String, Object>> ops = (List<Map<String, Object>>) request.get("operations");
+            String branchId = request.containsKey("branchId") ? String.valueOf(request.get("branchId")) : "main";
+            String writerId = request.containsKey("writerId") ? String.valueOf(request.get("writerId")) : null;
             List<TxnCoordinator.TxnOperation> operations = new ArrayList<>();
 
-            for (Map<String, String> op : ops) {
-                String opType = op.get("type");
-                String key = op.get("key");
-                byte[] value = op.containsKey("value") ?
-                        op.get("value").getBytes(StandardCharsets.UTF_8) : null;
+            for (Map<String, Object> op : ops) {
+                String opType = op.get("type") != null ? String.valueOf(op.get("type")) : "PUT";
+                String key = String.valueOf(op.get("key"));
+                byte[] value = op.get("value") != null ?
+                        String.valueOf(op.get("value")).getBytes(StandardCharsets.UTF_8) : null;
+                Long deltaAmount = op.get("deltaAmount") instanceof Number n ? n.longValue() : null;
 
-                TxnCoordinator.TxnOperation.OpType type =
-                        "DELETE".equalsIgnoreCase(opType) ?
-                                TxnCoordinator.TxnOperation.OpType.DELETE :
-                                TxnCoordinator.TxnOperation.OpType.PUT;
+                TxnCoordinator.TxnOperation.OpType type = switch (opType.toUpperCase()) {
+                    case "DELETE" -> TxnCoordinator.TxnOperation.OpType.DELETE;
+                    case "DELTA" -> TxnCoordinator.TxnOperation.OpType.DELTA;
+                    default -> TxnCoordinator.TxnOperation.OpType.PUT;
+                };
 
-                operations.add(new TxnCoordinator.TxnOperation(key, value, type));
+                operations.add(new TxnCoordinator.TxnOperation(key, value, type, deltaAmount));
             }
 
-            Boolean committed = txnCoordinator.execute(operations)
+            TxnCoordinator.TxnCommitResult commitResult = txnCoordinator
+                    .executeWithResult(operations, branchId, writerId)
                     .get(10, java.util.concurrent.TimeUnit.SECONDS);
 
             long latency = System.currentTimeMillis() - start;
-            result.put("success", committed);
+            result.put("success", commitResult.committed());
+            result.put("txnId", commitResult.txnId());
             result.put("latencyMs", latency);
             result.put("operationCount", operations.size());
+            if (commitResult.committed()) {
+                result.put("versionId", commitResult.versionId());
+                result.put("versionSequence", commitResult.versionSequence());
+                result.put("timestamp", commitResult.timestamp());
+                result.put("branchId", commitResult.branchId());
+            } else if (commitResult.error() != null) {
+                result.put("error", commitResult.error());
+            }
         } catch (Exception e) {
             result.put("success", false);
             result.put("error", e.getMessage());

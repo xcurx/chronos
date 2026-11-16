@@ -32,6 +32,14 @@ minidb:
     enabled: ${SPECULATION_ENABLED:true}
     timeout-ms: ${SPECULATION_TIMEOUT_MS:10000}
 
+# Chronos Time-Travel Retention & Safe Low-Watermark GC Configuration
+chronos:
+  retention:
+    policy: ${CHRONOS_RETENTION_POLICY:HYBRID}
+    max-versions: ${CHRONOS_RETENTION_MAX_VERSIONS:10000}
+    window-ms: ${CHRONOS_RETENTION_WINDOW_MS:3600000}
+    pinned-versions: ${CHRONOS_PINNED_VERSIONS:}
+
 # Actuator & Prometheus
 management:
   endpoints:
@@ -50,5 +58,6 @@ management:
 logging:
   level:
     com.minidb: INFO
+    com.chronos: INFO
     com.minidb.raft: DEBUG
     com.minidb.grpc: INFO

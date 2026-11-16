@@ -41,6 +41,7 @@ public class WebSocketPublisher {
                 case TXN -> "/topic/txn";
                 case MVCC -> "/topic/mvcc";
                 case CHAOS -> "/topic/chaos";
+                case CHRONOS -> "/topic/chronos";
             };
             messagingTemplate.convertAndSend(topic, event);
 

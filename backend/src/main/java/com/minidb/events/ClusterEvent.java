@@ -10,7 +10,7 @@ import java.util.UUID;
 public class ClusterEvent {
 
     public enum Category {
-        RAFT, REPLICATION, KV, HEARTBEAT, SNAPSHOT, TXN, MVCC, CHAOS
+        RAFT, REPLICATION, KV, HEARTBEAT, SNAPSHOT, TXN, MVCC, CHAOS, CHRONOS
     }
 
     private final String id;
@@ -184,6 +184,49 @@ public class ClusterEvent {
                 String.format("Cascade rollback: %d speculative versions (raftIdx ≥ %d)",
                         count, fromRaftIndex),
                 Map.of("count", count, "fromRaftIndex", fromRaftIndex));
+    }
+
+    // ================================================================
+    // Chronos Time-Travel, DAG & Merge Events
+    // ================================================================
+
+    public static ClusterEvent chronosVersionCreated(String nodeId, String versionId, long sequence,
+                                                     String branchId, int operationsCount) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_VERSION_CREATED", nodeId,
+                String.format("Chronos Version %s (seq=%d, branch=%s, ops=%d)", versionId, sequence, branchId, operationsCount),
+                Map.of("versionId", versionId, "sequence", sequence, "branchId", branchId, "operationsCount", operationsCount));
+    }
+
+    public static ClusterEvent chronosBranchCreated(String nodeId, String branchId, String baseVersionId, String writerId) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_BRANCH_CREATED", nodeId,
+                String.format("Branch '%s' forked from %s by %s", branchId, baseVersionId, writerId),
+                Map.of("branchId", branchId, "baseVersionId", baseVersionId, "writerId", writerId != null ? writerId : "unknown"));
+    }
+
+    public static ClusterEvent chronosConflictDetected(String nodeId, String branchA, String branchB, int conflictCount) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_CONFLICT_DETECTED", nodeId,
+                String.format("Detected %d conflict(s) between '%s' and '%s'", conflictCount, branchA, branchB),
+                Map.of("branchA", branchA, "branchB", branchB, "conflictCount", conflictCount));
+    }
+
+    public static ClusterEvent chronosMergeCommitted(String nodeId, String mergedVersionId, String targetBranch,
+                                                     String sourceBranch, String policy) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_MERGE_COMMITTED", nodeId,
+                String.format("Merged '%s' into '%s' -> %s (policy=%s)", sourceBranch, targetBranch, mergedVersionId, policy),
+                Map.of("mergedVersionId", mergedVersionId, "targetBranch", targetBranch, "sourceBranch", sourceBranch, "policy", policy));
+    }
+
+    public static ClusterEvent chronosMergeRejected(String nodeId, String targetBranch, String sourceBranch, String reason) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_MERGE_REJECTED", nodeId,
+                String.format("Merge rejected ('%s' -> '%s'): %s", sourceBranch, targetBranch, reason),
+                Map.of("targetBranch", targetBranch, "sourceBranch", sourceBranch, "reason", reason != null ? reason : "Unknown"));
+    }
+
+    public static ClusterEvent chronosWatermarkGc(String nodeId, long purgedVersions, long purgedMvcc, long watermarkSeq) {
+        return new ClusterEvent(Category.CHRONOS, "CHRONOS_WATERMARK_GC", nodeId,
+                String.format("Chronos GC: purged %d versions, %d MVCC entries (watermark seq=%d)",
+                        purgedVersions, purgedMvcc, watermarkSeq),
+                Map.of("purgedVersions", purgedVersions, "purgedMvcc", purgedMvcc, "watermarkSeq", watermarkSeq));
     }
 
     private static String formatBytes(long bytes) {
