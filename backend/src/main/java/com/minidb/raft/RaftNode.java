@@ -1,15 +1,24 @@
 package com.minidb.raft;
 
+import com.chronos.branch.BranchManager;
+import com.chronos.model.ChangeEntry;
+import com.chronos.model.ChronosVersion;
+import com.chronos.model.ChronosWritePayload;
+import com.chronos.model.OperationType;
+import com.chronos.model.VersionStatus;
+import com.chronos.storage.VersionCatalog;
 import com.minidb.config.RaftConfig;
 import com.minidb.events.ClusterEvent;
 import com.minidb.events.EventBus;
 import com.minidb.mvcc.MvccStore;
+import com.minidb.mvcc.VersionState;
 import com.minidb.storage.StorageEngine;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
@@ -54,6 +63,7 @@ public class RaftNode {
     private final RaftConfig config;
     private final RaftLog raftLog;
     private final MvccStore mvccStore;
+    private final VersionCatalog versionCatalog;
     private final StorageEngine storage;
     private final EventBus eventBus;
     private final ElectionTimer electionTimer;
@@ -61,15 +71,24 @@ public class RaftNode {
     private final ReentrantLock lock = new ReentrantLock();
     // Separate lightweight lock for log appends — avoids contention with main Raft lock
     private final ReentrantLock appendLock = new ReentrantLock();
+    // Serializes committed log entry application across scheduler and commit callbacks
+    private final Object applyLock = new Object();
 
     // Client request tracking: logIndex -> CompletableFuture
     private final Map<Long, CompletableFuture<Boolean>> pendingRequests = new ConcurrentHashMap<>();
 
-    // Speculative commit tracking: logIndex -> callback to run on commit
+    // Speculative commit & rollback tracking: logIndex -> callbacks
     private final Map<Long, Runnable> speculativeCommitCallbacks = new ConcurrentHashMap<>();
+    private final Map<Long, Runnable> speculativeRollbackCallbacks = new ConcurrentHashMap<>();
+
+    // Deterministic leader-side timestamp and version sequence allocation (protected by appendLock)
+    private final AtomicLong lastAssignedTimestamp = new AtomicLong(0);
+    private final AtomicLong inFlightSequence = new AtomicLong(0);
+    private final Map<String, String> inFlightBranchHeads = new ConcurrentHashMap<>();
 
     // Peer communication (set by gRPC service)
     private volatile RaftPeerClient peerClient;
+    private volatile BranchManager branchManager;
 
     // Chaos simulation
     private volatile boolean killed = false;
@@ -109,11 +128,21 @@ public class RaftNode {
 
     public RaftNode(RaftConfig config, StorageEngine storage, EventBus eventBus,
                     MeterRegistry meterRegistry) {
+        this(config, storage, eventBus, meterRegistry, new VersionCatalog(storage));
+    }
+
+    @Autowired
+    public RaftNode(RaftConfig config, StorageEngine storage, EventBus eventBus,
+                    MeterRegistry meterRegistry, VersionCatalog versionCatalog) {
         this.config = config;
         this.storage = storage;
         this.eventBus = eventBus;
         this.raftLog = new RaftLog(storage);
         this.mvccStore = new MvccStore(storage, eventBus);
+        this.versionCatalog = versionCatalog != null ? versionCatalog : new VersionCatalog(storage);
+        this.inFlightSequence.set(this.versionCatalog.getHighestSequence());
+        this.lastAssignedTimestamp.set(Math.max(System.currentTimeMillis(), this.versionCatalog.getLatestTimestamp()));
+        this.mvccStore.observeTimestamp(this.lastAssignedTimestamp.get());
         this.electionTimer = new ElectionTimer(config.getElectionTimeoutMin(),
                 config.getElectionTimeoutMax());
         this.snapshotManager = new SnapshotManager(storage, raftLog, config);
@@ -288,10 +317,16 @@ public class RaftNode {
         }
 
         // Append a no-op entry to commit entries from previous terms
-        RaftLog.Entry noop = new RaftLog.Entry(
-                raftLog.getLastIndex() + 1, currentTerm,
-                RaftLog.CommandType.NOOP, "", null);
-        raftLog.append(noop);
+        appendLock.lock();
+        try {
+            syncChronosLeaderStateLocked();
+            RaftLog.Entry noop = new RaftLog.Entry(
+                    raftLog.getLastIndex() + 1, currentTerm,
+                    RaftLog.CommandType.NOOP, "", null);
+            raftLog.append(noop);
+        } finally {
+            appendLock.unlock();
+        }
 
         // Start heartbeat timer
         startHeartbeats();
@@ -306,6 +341,10 @@ public class RaftNode {
     }
 
     private void sendHeartbeats() {
+        if (config.getPeers().isEmpty()) {
+            tryAdvanceCommitIndex();
+            return;
+        }
         if (peerClient == null) return;
 
         for (String peer : config.getPeers()) {
@@ -499,6 +538,9 @@ public class RaftNode {
                     if (existingTerm != -1 && existingTerm != entry.term()) {
                         // Conflicting entry - delete it and all after
                         raftLog.truncateFrom(entry.index());
+                        mvccStore.cascadeRollback(entry.index());
+                        versionCatalog.rollbackSpeculativeByRaftIndex(entry.index());
+                        inFlightBranchHeads.clear();
                     }
                     if (raftLog.getTermAt(entry.index()) == -1) {
                         raftLog.append(entry);
@@ -546,6 +588,10 @@ public class RaftNode {
 
             if (done) {
                 snapshotManager.applyReceivedSnapshot(lastIncludedIndex, lastIncludedTerm);
+                versionCatalog.reloadFromStorage();
+                inFlightSequence.set(versionCatalog.getHighestSequence());
+                inFlightBranchHeads.clear();
+                lastAssignedTimestamp.accumulateAndGet(versionCatalog.getLatestTimestamp(), Math::max);
                 commitIndex = lastIncludedIndex;
                 lastApplied = lastIncludedIndex;
                 log.info("[{}] Snapshot installed up to index {}", config.getNodeId(), lastIncludedIndex);
@@ -565,53 +611,88 @@ public class RaftNode {
      * Submit a Put command. Returns a future that completes when committed.
      */
     public CompletableFuture<Boolean> submitPut(String key, byte[] value) {
-        return submitCommand(RaftLog.CommandType.PUT, key, value);
+        return submitPutWithResult(key, value).thenApply(ChronosWriteResult::committed);
+    }
+
+    /**
+     * Submit a Put command and return the committed Chronos version metadata.
+     */
+    public CompletableFuture<ChronosWriteResult> submitPutWithResult(String key, byte[] value) {
+        return submitCommandWithResult(RaftLog.CommandType.PUT, key, value, "main", null, null, null);
     }
 
     /**
      * Submit a Delete command. Returns a future that completes when committed.
      */
     public CompletableFuture<Boolean> submitDelete(String key) {
-        return submitCommand(RaftLog.CommandType.DELETE, key, null);
+        return submitDeleteWithResult(key).thenApply(ChronosWriteResult::committed);
     }
 
-    private CompletableFuture<Boolean> submitCommand(RaftLog.CommandType type,
-                                                      String key, byte[] value) {
-        if (role != Role.LEADER) {
-            return CompletableFuture.completedFuture(false);
-        }
-        if (killed) {
-            return CompletableFuture.completedFuture(false);
+    /**
+     * Submit a Delete command and return the committed Chronos version metadata.
+     */
+    public CompletableFuture<ChronosWriteResult> submitDeleteWithResult(String key) {
+        return submitCommandWithResult(RaftLog.CommandType.DELETE, key, null, "main", null, null, null);
+    }
+
+    /**
+     * Submit a structured multi-key or branched Chronos write payload through Raft consensus.
+     */
+    public CompletableFuture<ChronosWriteResult> submitChronosWrite(
+            RaftLog.CommandType type, ChronosWritePayload payload) {
+        return submitCommandWithResult(
+                type,
+                payload.getTxnId(),
+                payload.toJsonBytes(),
+                payload.getBranchId(),
+                payload.getWriterId(),
+                payload.getParentVersionIds(),
+                null);
+    }
+
+    private CompletableFuture<ChronosWriteResult> submitCommandWithResult(
+            RaftLog.CommandType type,
+            String key,
+            byte[] value,
+            String branchId,
+            String writerId,
+            List<String> explicitParents,
+            String explicitVersionId) {
+        if (role != Role.LEADER || killed) {
+            return CompletableFuture.completedFuture(
+                    ChronosWriteResult.failed("Not the leader or node is killed"));
         }
 
-        lock.lock();
+        RaftLog.Entry entry;
+        CompletableFuture<Boolean> commitFuture;
+        appendLock.lock();
         try {
-            RaftLog.Entry entry = new RaftLog.Entry(
-                    raftLog.getLastIndex() + 1, currentTerm, type, key, value);
-            raftLog.append(entry);
-            logEntriesTotal.increment();
-
-            CompletableFuture<Boolean> future = new CompletableFuture<>();
-            pendingRequests.put(entry.index(), future);
-
-            // Coalesced replication: batch multiple writes within a short window
-            // into a single AppendEntries RPC per peer (Challenge §4: Baseline Fairness)
-            if (batchingEnabled) {
-                scheduleBatchFlush();
-            } else {
-                // Immediate replication (original behavior)
-                sendHeartbeats();
+            if (role != Role.LEADER || killed) {
+                return CompletableFuture.completedFuture(
+                        ChronosWriteResult.failed("Not the leader or node is killed"));
             }
-
-            // Timeout pending requests
-            CompletableFuture.delayedExecutor(5, TimeUnit.SECONDS)
-                    .execute(() -> future.completeExceptionally(
-                            new TimeoutException("Command not committed within timeout")));
-
-            return future;
+            entry = buildAndAppendEntryLocked(
+                    type, key, value, branchId, writerId, explicitParents, explicitVersionId);
+            commitFuture = new CompletableFuture<>();
+            pendingRequests.put(entry.index(), commitFuture);
         } finally {
-            lock.unlock();
+            appendLock.unlock();
         }
+
+        if (batchingEnabled) {
+            scheduleBatchFlush();
+        } else {
+            sendHeartbeats();
+        }
+
+        CompletableFuture.delayedExecutor(5, TimeUnit.SECONDS)
+                .execute(() -> commitFuture.completeExceptionally(
+                        new TimeoutException("Command not committed within timeout")));
+
+        return commitFuture.thenApply(committed -> committed != null && committed
+                ? ChronosWriteResult.committed(entry.versionId(), entry.versionSequence(),
+                        entry.timestamp(), entry.index(), entry.branchId())
+                : ChronosWriteResult.failed("Raft commit rejected or lost leadership"));
     }
 
     /**
@@ -635,34 +716,42 @@ public class RaftNode {
     }
 
     /**
-     * Linearizable read using ReadIndex protocol.
+     * Confirm Raft leadership and block until the local state machine has applied all
+     * entries up to the ReadIndex captured at read start.
      */
-    public CompletableFuture<MvccStore.MvccResult> consistentGet(String key) {
+    public CompletableFuture<Void> awaitLinearizableReadBarrier() {
         if (role != Role.LEADER) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("Not the leader"));
         }
 
         long readIndex = commitIndex;
-
-        // Confirm leadership with a heartbeat round
-        return confirmLeadership().thenApply(confirmed -> {
-            if (!confirmed) {
+        return confirmLeadership().thenAccept(confirmed -> {
+            if (!confirmed || role != Role.LEADER) {
                 throw new CompletionException(
                         new IllegalStateException("Lost leadership during read"));
             }
-            // Wait for lastApplied >= readIndex
             while (lastApplied < readIndex) {
+                if (killed || role != Role.LEADER) {
+                    throw new CompletionException(
+                            new IllegalStateException("Node stepped down before applying ReadIndex " + readIndex));
+                }
                 Thread.onSpinWait();
             }
-            return mvccStore.get(key);
         });
+    }
+
+    /**
+     * Linearizable read using ReadIndex protocol.
+     */
+    public CompletableFuture<MvccStore.MvccResult> consistentGet(String key) {
+        return awaitLinearizableReadBarrier().thenApply(v -> mvccStore.get(key));
     }
 
     /**
      * Confirm leadership by getting acknowledgment from majority.
      */
-    private CompletableFuture<Boolean> confirmLeadership() {
+    public CompletableFuture<Boolean> confirmLeadership() {
         if (config.getPeers().isEmpty()) {
             return CompletableFuture.completedFuture(true);
         }
@@ -717,44 +806,113 @@ public class RaftNode {
      * @return the log index, or -1 if not leader/killed
      */
     public long appendToLog(RaftLog.CommandType type, String key, byte[] value) {
-        if (role != Role.LEADER || killed) return -1;
+        RaftLog.Entry entry = appendChronosEntry(type, key, value, "main", null, null, null);
+        return entry != null ? entry.index() : -1;
+    }
+
+    /**
+     * Append a command to the Raft log with deterministic leader-assigned timestamp
+     * and Chronos version metadata WITHOUT blocking for replication.
+     *
+     * @return the appended {@link RaftLog.Entry}, or {@code null} if not leader/killed
+     */
+    public RaftLog.Entry appendChronosEntry(
+            RaftLog.CommandType type,
+            String key,
+            byte[] value,
+            String branchId,
+            String writerId,
+            List<String> explicitParents,
+            String explicitVersionId) {
+        if (role != Role.LEADER || killed) return null;
 
         appendLock.lock();
         try {
-            RaftLog.Entry entry = new RaftLog.Entry(
-                    raftLog.getLastIndex() + 1, currentTerm, type, key, value);
-            raftLog.append(entry);
-            logEntriesTotal.increment();
-            return entry.index();
+            if (role != Role.LEADER || killed) return null;
+            return buildAndAppendEntryLocked(
+                    type, key, value, branchId, writerId, explicitParents, explicitVersionId);
         } finally {
             appendLock.unlock();
         }
     }
 
+    private RaftLog.Entry buildAndAppendEntryLocked(
+            RaftLog.CommandType type,
+            String key,
+            byte[] value,
+            String branchId,
+            String writerId,
+            List<String> explicitParents,
+            String explicitVersionId) {
+        String effectiveBranch = (branchId != null && !branchId.isBlank()) ? branchId : "main";
+        long seq = Math.max(inFlightSequence.get(), versionCatalog.getHighestSequence()) + 1;
+        inFlightSequence.set(seq);
+
+        String versionId = (explicitVersionId != null && !explicitVersionId.isBlank())
+                ? explicitVersionId
+                : ("main".equals(effectiveBranch) ? "V" + seq : effectiveBranch + "-V" + seq);
+
+        List<String> parents;
+        if (explicitParents != null && !explicitParents.isEmpty()) {
+            parents = List.copyOf(explicitParents);
+        } else {
+            String head = inFlightBranchHeads.get(effectiveBranch);
+            if (head == null) {
+                head = versionCatalog.getBranchHead(effectiveBranch).orElse(null);
+            }
+            if (head == null && branchManager != null) {
+                head = branchManager.getBranch(effectiveBranch)
+                        .map(b -> b.getHeadVersionId() != null ? b.getHeadVersionId() : b.getBaseVersionId())
+                        .orElse(null);
+            }
+            parents = (head != null && !head.isBlank()) ? List.of(head) : List.of();
+        }
+
+        long now = System.currentTimeMillis();
+        long prevTs = Math.max(lastAssignedTimestamp.get(), versionCatalog.getLatestTimestamp());
+        long ts = Math.max(now, prevTs + 1);
+        lastAssignedTimestamp.set(ts);
+        mvccStore.observeTimestamp(ts);
+
+        long index = raftLog.getLastIndex() + 1;
+        RaftLog.Entry entry = new RaftLog.Entry(
+                index, currentTerm, type, key, value, ts,
+                versionId, seq, effectiveBranch, writerId, parents);
+        raftLog.append(entry);
+        logEntriesTotal.increment();
+        inFlightBranchHeads.put(effectiveBranch, versionId);
+        return entry;
+    }
+
+    private void syncChronosLeaderStateLocked() {
+        inFlightBranchHeads.clear();
+        inFlightSequence.set(versionCatalog.getHighestSequence());
+        long maxTs = Math.max(System.currentTimeMillis(), versionCatalog.getLatestTimestamp());
+        lastAssignedTimestamp.accumulateAndGet(maxTs, Math::max);
+        mvccStore.observeTimestamp(lastAssignedTimestamp.get());
+    }
+
     /**
      * Register a callback to be invoked when a speculative write at the given
      * log index is committed by Raft consensus (majority ACK).
-     *
-     * <p><b>Race-condition fix:</b> Between {@code appendToLog()} and this
-     * registration, a concurrent heartbeat/replication cycle can commit the
-     * entry via {@code applyCommittedEntries()}, which finds no callback and
-     * falls through to {@code applyEntry()}. The callback would then stay
-     * orphaned and eventually time out — creating a false rollback.</p>
-     *
-     * <p>To prevent this, after registration we check if the entry has already
-     * been applied ({@code logIndex <= lastApplied}). If so, we fire the
-     * callback immediately. ConcurrentHashMap's thread-safety guarantees
-     * prevent double-execution: if {@code applyCommittedEntries()} already
-     * removed and ran the callback, our {@code remove()} returns null.</p>
      */
     public void trackSpeculativeCommit(long logIndex, Runnable onCommit) {
+        trackSpeculativeCommit(logIndex, onCommit, null);
+    }
+
+    /**
+     * Register commit and optional rollback callbacks for a speculative write.
+     */
+    public void trackSpeculativeCommit(long logIndex, Runnable onCommit, Runnable onRollback) {
         speculativeCommitCallbacks.put(logIndex, onCommit);
+        if (onRollback != null) {
+            speculativeRollbackCallbacks.put(logIndex, onRollback);
+        }
 
         // Fix race: entry may already be committed + applied before we registered.
-        // If so, applyCommittedEntries() found no callback and used applyEntry().
-        // Fire the callback now to complete the future and prevent false rollback.
         if (logIndex <= lastApplied) {
             Runnable cb = speculativeCommitCallbacks.remove(logIndex);
+            speculativeRollbackCallbacks.remove(logIndex);
             if (cb != null) {
                 try {
                     cb.run();
@@ -769,11 +927,6 @@ public class RaftNode {
     /**
      * Trigger coalesced replication to all peers (non-blocking).
      * Called by SpeculativeManager after appending a speculative entry.
-     *
-     * <p>Uses the same batching window as standard writes to avoid
-     * redundant gRPC calls when multiple speculative writes arrive
-     * concurrently. This eliminates the "replication storm" that
-     * caused p95 tail latency spikes.</p>
      */
     public void triggerReplication() {
         if (role == Role.LEADER && !killed) {
@@ -788,57 +941,228 @@ public class RaftNode {
     private void applyCommittedEntries() {
         if (killed) return;
 
-        while (lastApplied < commitIndex) {
-            lastApplied++;
-            RaftLog.Entry entry = raftLog.getEntry(lastApplied);
-            if (entry == null) break;
+        synchronized (applyLock) {
+            while (!killed && lastApplied < commitIndex) {
+                lastApplied++;
+                RaftLog.Entry entry = raftLog.getEntry(lastApplied);
+                if (entry == null) {
+                    lastApplied--;
+                    break;
+                }
 
-            // Fire speculative commit callback INSTEAD of applying to MVCC
-            // (speculative path already wrote the value — just promote it)
-            Runnable specCallback = speculativeCommitCallbacks.remove(entry.index());
-            if (specCallback != null) {
-                try {
-                    specCallback.run();
-                } catch (Exception e) {
-                    log.error("[{}] Speculative callback failed at index {}: {}",
-                            config.getNodeId(), entry.index(), e.getMessage());
-                    // Callback failed but entry IS committed — apply normally as fallback
+                // Fire speculative commit callback INSTEAD of applying to MVCC
+                // (speculative path already wrote the value — just promote it)
+                Runnable specCallback = speculativeCommitCallbacks.remove(entry.index());
+                speculativeRollbackCallbacks.remove(entry.index());
+                if (specCallback != null) {
+                    try {
+                        specCallback.run();
+                    } catch (Exception e) {
+                        log.error("[{}] Speculative callback failed at index {}: {}",
+                                config.getNodeId(), entry.index(), e.getMessage());
+                        // Callback failed but entry IS committed — apply normally as fallback
+                        applyEntry(entry);
+                    }
+                } else {
+                    // Standard path: apply deterministically to MVCC + VersionCatalog
                     applyEntry(entry);
                 }
-            } else {
-                // Standard path: apply to MVCC store normally
-                applyEntry(entry);
-            }
 
-            // Complete pending client request
-            CompletableFuture<Boolean> future = pendingRequests.remove(entry.index());
-            if (future != null) {
-                future.complete(true);
+                // Complete pending client request
+                CompletableFuture<Boolean> future = pendingRequests.remove(entry.index());
+                if (future != null) {
+                    future.complete(true);
+                }
             }
         }
     }
 
     private void applyEntry(RaftLog.Entry entry) {
+        if (entry.type() == RaftLog.CommandType.NOOP) {
+            log.debug("[{}] Applied NOOP at index {}", config.getNodeId(), entry.index());
+            return;
+        }
+
+        long ts = entry.timestamp() > 0 ? entry.timestamp() : mvccStore.nextTimestamp();
+        boolean hasVersionMetadata = entry.versionId() != null
+                && !entry.versionId().isBlank()
+                && entry.versionSequence() >= 1;
+
+        if (hasVersionMetadata) {
+            Optional<ChronosVersion> existing = versionCatalog.getVersion(entry.versionId());
+            if (existing.isPresent()
+                    && existing.get().isCommitted()
+                    && existing.get().getRaftLogIndex() == entry.index()) {
+                mvccStore.observeTimestamp(ts);
+                return;
+            }
+        }
+
         switch (entry.type()) {
             case PUT -> {
                 if (entry.key() != null && entry.value() != null) {
-                    mvccStore.put(entry.key(), entry.value(), mvccStore.nextTimestamp());
-                    log.debug("[{}] Applied PUT: key={}", config.getNodeId(), entry.key());
+                    byte[] oldVal = hasVersionMetadata ? mvccStore.getLatestLinearizableBytes(entry.key()) : null;
+                    mvccStore.put(entry.key(), entry.value(), ts);
+                    if (hasVersionMetadata) {
+                        persistSingleChangeVersion(entry, ts,
+                                ChangeEntry.put(entry.key(), oldVal, entry.value(), entry.writerId()));
+                    }
+                    log.debug("[{}] Applied PUT: key={}, ts={}", config.getNodeId(), entry.key(), ts);
                 }
             }
             case DELETE -> {
                 if (entry.key() != null) {
-                    mvccStore.delete(entry.key(), mvccStore.nextTimestamp());
-                    log.debug("[{}] Applied DELETE: key={}", config.getNodeId(), entry.key());
+                    byte[] oldVal = hasVersionMetadata ? mvccStore.getLatestLinearizableBytes(entry.key()) : null;
+                    mvccStore.delete(entry.key(), ts);
+                    if (hasVersionMetadata) {
+                        persistSingleChangeVersion(entry, ts,
+                                ChangeEntry.delete(entry.key(), oldVal, entry.writerId()));
+                    }
+                    log.debug("[{}] Applied DELETE: key={}, ts={}", config.getNodeId(), entry.key(), ts);
                 }
             }
-            case NOOP -> {
-                log.debug("[{}] Applied NOOP at index {}", config.getNodeId(), entry.index());
+            case CHRONOS_WRITE, CHRONOS_TXN, CHRONOS_BRANCH_WRITE, CHRONOS_MERGE -> {
+                if (entry.value() == null) break;
+                ChronosWritePayload payload = ChronosWritePayload.fromJsonBytes(entry.value());
+                String branch = !entry.branchId().isBlank() ? entry.branchId() : payload.getBranchId();
+                List<String> parents = !entry.parentVersionIds().isEmpty()
+                        ? entry.parentVersionIds()
+                        : payload.getParentVersionIds();
+                List<ChangeEntry> changes = captureChangeEntries(payload, branch, parents);
+                if ("main".equals(branch)) {
+                    mvccStore.writeBatchAt(payload.getOperations(), ts, VersionState.COMMITTED);
+                }
+
+                if (hasVersionMetadata) {
+                    String writer = payload.getWriterId() != null ? payload.getWriterId() : entry.writerId();
+                    ChronosVersion version = ChronosVersion.builder()
+                            .versionId(entry.versionId())
+                            .sequence(entry.versionSequence())
+                            .parentVersionIds(parents)
+                            .branchId(branch)
+                            .timestamp(ts)
+                            .raftLogIndex(entry.index())
+                            .writerId(writer)
+                            .transactionId(payload.getTxnId())
+                            .status(VersionStatus.COMMITTED)
+                            .isMerge(payload.isMerge())
+                            .mergePolicy(payload.getMergePolicy())
+                            .conflictMetadata(payload.getConflictMetadata())
+                            .changeSet(changes)
+                            .build();
+                    versionCatalog.saveCommittedFromRaft(version);
+                    if (branchManager != null) {
+                        branchManager.recordCommitToBranch(branch, entry.versionId(), writer);
+                    }
+                    if (eventBus != null) {
+                        eventBus.publish(ClusterEvent.chronosVersionCreated(
+                                config.getNodeId(), entry.versionId(), entry.versionSequence(), branch, changes.size()));
+                    }
+                }
+                log.debug("[{}] Applied {}: versionId={}, ops={}, ts={}",
+                        config.getNodeId(), entry.type(), entry.versionId(),
+                        payload.getOperations().size(), ts);
             }
             default -> {
                 log.debug("[{}] Skipping entry type: {}", config.getNodeId(), entry.type());
             }
         }
+    }
+
+    private void persistSingleChangeVersion(RaftLog.Entry entry, long ts, ChangeEntry change) {
+        ChronosVersion version = ChronosVersion.builder()
+                .versionId(entry.versionId())
+                .sequence(entry.versionSequence())
+                .parentVersionIds(entry.parentVersionIds())
+                .branchId(entry.branchId())
+                .timestamp(ts)
+                .raftLogIndex(entry.index())
+                .writerId(entry.writerId())
+                .status(VersionStatus.COMMITTED)
+                .changeSet(List.of(change))
+                .build();
+        versionCatalog.saveCommittedFromRaft(version);
+        if (branchManager != null) {
+            branchManager.recordCommitToBranch(entry.branchId(), entry.versionId(), entry.writerId());
+        }
+        if (eventBus != null) {
+            eventBus.publish(ClusterEvent.chronosVersionCreated(
+                    config.getNodeId(), entry.versionId(), entry.versionSequence(), entry.branchId(), 1));
+        }
+    }
+
+    private List<ChangeEntry> captureChangeEntries(ChronosWritePayload payload, String branch, List<String> parents) {
+        List<ChangeEntry> changes = new ArrayList<>(payload.getOperations().size());
+        Map<String, Optional<byte[]>> priorValues = new HashMap<>();
+        for (ChronosWritePayload.WriteOp op : payload.getOperations()) {
+            byte[] oldVal = priorValues.computeIfAbsent(
+                            op.getKey(),
+                            k -> Optional.ofNullable(resolvePriorValueForBranch(k, branch, parents)))
+                    .orElse(null);
+            switch (op.getOpType()) {
+                case PUT -> {
+                    changes.add(ChangeEntry.put(op.getKey(), oldVal, op.getValue(), payload.getWriterId()));
+                    priorValues.put(op.getKey(), Optional.ofNullable(op.getValue()));
+                }
+                case DELETE -> {
+                    changes.add(ChangeEntry.delete(op.getKey(), oldVal, payload.getWriterId()));
+                    priorValues.put(op.getKey(), Optional.empty());
+                }
+                case DELTA -> {
+                    long delta = op.getDeltaAmount() != null ? op.getDeltaAmount() : 0L;
+                    changes.add(ChangeEntry.delta(op.getKey(), oldVal, op.getValue(), delta, payload.getWriterId()));
+                    priorValues.put(op.getKey(), Optional.ofNullable(op.getValue()));
+                }
+            }
+        }
+        return changes;
+    }
+
+    private byte[] resolvePriorValueForBranch(String key, String branch, List<String> parents) {
+        if ("main".equals(branch)) {
+            return mvccStore.getLatestLinearizableBytes(key);
+        }
+        if (parents != null && !parents.isEmpty()) {
+            return resolveKeyAtVersion(key, parents.get(0));
+        }
+        if (branchManager != null) {
+            String headOrBase = branchManager.getBranch(branch)
+                    .map(b -> b.getHeadVersionId() != null ? b.getHeadVersionId() : b.getBaseVersionId())
+                    .orElse(null);
+            if (headOrBase != null) {
+                return resolveKeyAtVersion(key, headOrBase);
+            }
+        }
+        return mvccStore.getLatestLinearizableBytes(key);
+    }
+
+    private byte[] resolveKeyAtVersion(String key, String versionId) {
+        Deque<String> queue = new ArrayDeque<>();
+        Set<String> visited = new HashSet<>();
+        queue.add(versionId);
+        visited.add(versionId);
+
+        while (!queue.isEmpty()) {
+            String currId = queue.poll();
+            Optional<ChronosVersion> verOpt = versionCatalog.getVersion(currId);
+            if (verOpt.isEmpty()) continue;
+            ChronosVersion v = verOpt.get();
+            for (int i = v.getChangeSet().size() - 1; i >= 0; i--) {
+                ChangeEntry change = v.getChangeSet().get(i);
+                if (key.equals(change.getKey())) {
+                    if (change.getOpType() == OperationType.DELETE || !change.isNewPresent()) {
+                        return null;
+                    }
+                    return change.getNewValue();
+                }
+            }
+            for (String p : v.getParentVersionIds()) {
+                if (p != null && !p.isBlank() && visited.add(p)) {
+                    queue.add(p);
+                }
+            }
+        }
+        return mvccStore.getLatestLinearizableBytes(key);
     }
 
     // ============================================================
@@ -853,16 +1177,30 @@ public class RaftNode {
         leaderId = null;
         persistState();
 
-        // Cascade rollback: all speculative entries above commitIndex are invalid
-        if (oldRole == Role.LEADER && !speculativeCommitCallbacks.isEmpty()) {
-            log.info("[{}] Leadership lost — cascade rollback of speculative entries above commitIndex {}",
-                    config.getNodeId(), commitIndex);
-            int rolledBack = mvccStore.cascadeRollback(commitIndex + 1);
+        inFlightBranchHeads.clear();
+        inFlightSequence.set(versionCatalog.getHighestSequence());
 
-            // Fail any pending speculative callbacks
+        // Cascade rollback: all speculative entries above commitIndex are invalid
+        if (oldRole == Role.LEADER) {
+            mvccStore.cascadeRollback(commitIndex + 1);
+            versionCatalog.rollbackSpeculativeByRaftIndex(commitIndex + 1);
+
+            if (!speculativeRollbackCallbacks.isEmpty()) {
+                log.info("[{}] Leadership lost — running rollback callbacks above commitIndex {}",
+                        config.getNodeId(), commitIndex);
+                speculativeRollbackCallbacks.forEach((idx, rb) -> {
+                    if (idx > commitIndex && rb != null) {
+                        try {
+                            rb.run();
+                        } catch (Exception ignored) {
+                            // Best effort
+                        }
+                    }
+                });
+            }
+            speculativeRollbackCallbacks.clear();
             speculativeCommitCallbacks.clear();
 
-            // Fail pending standard requests too
             pendingRequests.forEach((idx, future) -> future.complete(false));
             pendingRequests.clear();
         }
@@ -967,7 +1305,14 @@ public class RaftNode {
     public boolean isLeader() { return role == Role.LEADER && !killed; }
     public RaftLog getRaftLog() { return raftLog; }
     public MvccStore getMvccStore() { return mvccStore; }
+    public VersionCatalog getVersionCatalog() { return versionCatalog; }
     public SnapshotManager getSnapshotManager() { return snapshotManager; }
+    public BranchManager getBranchManager() { return branchManager; }
+
+    @Autowired(required = false)
+    public void setBranchManager(BranchManager branchManager) {
+        this.branchManager = branchManager;
+    }
     public Map<String, Long> getNextIndex() { return Collections.unmodifiableMap(nextIndex); }
     public Map<String, Long> getMatchIndex() { return Collections.unmodifiableMap(matchIndex); }
     public Set<String> getPartitionedPeers() { return Collections.unmodifiableSet(partitionedPeers); }
@@ -1027,4 +1372,23 @@ public class RaftNode {
     // Record types for RPC results
     public record RequestVoteResult(long term, boolean voteGranted) {}
     public record AppendEntriesResult(long term, boolean success, long matchIndex) {}
+
+    public record ChronosWriteResult(
+            boolean committed,
+            String versionId,
+            long versionSequence,
+            long timestamp,
+            long raftLogIndex,
+            String branchId,
+            String error) {
+
+        public static ChronosWriteResult committed(
+                String versionId, long versionSequence, long timestamp, long raftLogIndex, String branchId) {
+            return new ChronosWriteResult(true, versionId, versionSequence, timestamp, raftLogIndex, branchId, null);
+        }
+
+        public static ChronosWriteResult failed(String error) {
+            return new ChronosWriteResult(false, null, 0L, 0L, -1L, "main", error);
+        }
+    }
 }

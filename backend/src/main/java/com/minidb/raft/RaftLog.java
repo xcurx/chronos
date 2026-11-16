@@ -27,10 +27,32 @@ public class RaftLog {
     private static final int MAX_CACHE_SIZE = 10000;
 
     public enum CommandType {
-        NOOP, PUT, DELETE, TXN_PREPARE, TXN_COMMIT, TXN_ABORT
+        NOOP, PUT, DELETE, TXN_PREPARE, TXN_COMMIT, TXN_ABORT,
+        CHRONOS_WRITE, CHRONOS_TXN, CHRONOS_BRANCH_WRITE, CHRONOS_MERGE
     }
 
-    public record Entry(long index, long term, CommandType type, String key, byte[] value) {
+    public record Entry(
+            long index,
+            long term,
+            CommandType type,
+            String key,
+            byte[] value,
+            long timestamp,
+            String versionId,
+            long versionSequence,
+            String branchId,
+            String writerId,
+            List<String> parentVersionIds) {
+
+        public Entry {
+            branchId = (branchId != null && !branchId.isBlank()) ? branchId : "main";
+            parentVersionIds = parentVersionIds != null ? List.copyOf(parentVersionIds) : List.of();
+        }
+
+        public Entry(long index, long term, CommandType type, String key, byte[] value) {
+            this(index, term, type, key, value, 0L, null, 0L, "main", null, List.of());
+        }
+
         public byte[] serialize() {
             try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
                  DataOutputStream dos = new DataOutputStream(bos)) {
@@ -43,6 +65,15 @@ public class RaftLog {
                     dos.write(value);
                 } else {
                     dos.writeInt(-1);
+                }
+                dos.writeLong(timestamp);
+                dos.writeUTF(versionId != null ? versionId : "");
+                dos.writeLong(versionSequence);
+                dos.writeUTF(branchId);
+                dos.writeUTF(writerId != null ? writerId : "");
+                dos.writeInt(parentVersionIds.size());
+                for (String parent : parentVersionIds) {
+                    dos.writeUTF(parent);
                 }
                 return bos.toByteArray();
             } catch (IOException e) {
@@ -63,7 +94,32 @@ public class RaftLog {
                     value = new byte[valueLen];
                     dis.readFully(value);
                 }
-                return new Entry(index, term, type, key, value);
+                long timestamp = 0L;
+                String versionId = null;
+                long versionSequence = 0L;
+                String branchId = "main";
+                String writerId = null;
+                List<String> parents = List.of();
+                if (dis.available() > 0) {
+                    timestamp = dis.readLong();
+                    String rawVerId = dis.readUTF();
+                    versionId = rawVerId.isEmpty() ? null : rawVerId;
+                    versionSequence = dis.readLong();
+                    String rawBranch = dis.readUTF();
+                    branchId = rawBranch.isEmpty() ? "main" : rawBranch;
+                    String rawWriter = dis.readUTF();
+                    writerId = rawWriter.isEmpty() ? null : rawWriter;
+                    int parentCount = dis.readInt();
+                    if (parentCount > 0) {
+                        List<String> list = new ArrayList<>(parentCount);
+                        for (int i = 0; i < parentCount; i++) {
+                            list.add(dis.readUTF());
+                        }
+                        parents = List.copyOf(list);
+                    }
+                }
+                return new Entry(index, term, type, key, value, timestamp,
+                        versionId, versionSequence, branchId, writerId, parents);
             } catch (IOException e) {
                 throw new RuntimeException("Failed to deserialize log entry", e);
             }

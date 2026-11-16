@@ -63,21 +63,7 @@ public class RaftGrpcService extends RaftServiceGrpc.RaftServiceImplBase {
         // Convert proto entries to internal format
         List<RaftLog.Entry> entries = new ArrayList<>();
         for (LogEntry protoEntry : request.getEntriesList()) {
-            RaftLog.CommandType type = switch (protoEntry.getCommandType()) {
-                case PUT -> RaftLog.CommandType.PUT;
-                case DELETE -> RaftLog.CommandType.DELETE;
-                case TXN_PREPARE -> RaftLog.CommandType.TXN_PREPARE;
-                case TXN_COMMIT -> RaftLog.CommandType.TXN_COMMIT;
-                case TXN_ABORT -> RaftLog.CommandType.TXN_ABORT;
-                default -> RaftLog.CommandType.NOOP;
-            };
-
-            entries.add(new RaftLog.Entry(
-                    protoEntry.getIndex(),
-                    protoEntry.getTerm(),
-                    type,
-                    protoEntry.getKey(),
-                    protoEntry.getValue().toByteArray()));
+            entries.add(RaftProtoMapper.fromProtoEntry(protoEntry));
         }
 
         RaftNode.AppendEntriesResult result = raftNode.handleAppendEntries(

@@ -1,5 +1,8 @@
 package com.minidb.speculation;
 
+import com.chronos.model.ChangeEntry;
+import com.chronos.model.ChronosVersion;
+import com.chronos.model.VersionStatus;
 import com.minidb.events.ClusterEvent;
 import com.minidb.events.EventBus;
 import com.minidb.mvcc.MvccStore;
@@ -13,8 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -231,87 +233,9 @@ public class SpeculativeManager {
     public SpeculativeResult submitSpeculativePut(RaftNode raftNode, String key, byte[] value,
                                                    AckPolicy ackPolicy) {
         if (!speculationEnabled.get()) {
-            // Fallback to standard path
             return submitStandard(raftNode, key, value, RaftLog.CommandType.PUT);
         }
-
-        long startNanos = System.nanoTime();
-
-        // Step 1: Append to Raft log (get the log index)
-        long logIndex = raftNode.appendToLog(RaftLog.CommandType.PUT, key, value);
-        if (logIndex < 0) {
-            return SpeculativeResult.failed("Not the leader or node is killed");
-        }
-
-        // Step 2: Write to MVCC store as SPECULATIVE
-        MvccStore mvccStore = raftNode.getMvccStore();
-        long timestamp = mvccStore.putSpeculative(key, value, logIndex);
-
-        // Step 3: Record speculative write timing
-        long writeLatencyNanos = System.nanoTime() - startNanos;
-        speculativeWriteTimer.record(writeLatencyNanos, TimeUnit.NANOSECONDS);
-        speculativeWriteCounter.increment();
-        speculativeWriteCount.incrementAndGet();
-        totalSpeculativeLatencyNanos.addAndGet(writeLatencyNanos);
-
-        String trackingKey = key + ":" + timestamp;
-        speculationStartTimes.put(trackingKey, System.nanoTime());
-
-        // Step 4: Trigger async replication (non-blocking)
-        CompletableFuture<Boolean> commitFuture = new CompletableFuture<>();
-        raftNode.trackSpeculativeCommit(logIndex, () -> {
-            // Commit promotion callback — runs when Raft confirms majority
-            long promotionNanos = System.nanoTime() - speculationStartTimes.getOrDefault(trackingKey, System.nanoTime());
-            mvccStore.commitVersion(key, timestamp);
-
-            commitPromotionTimer.record(promotionNanos, TimeUnit.NANOSECONDS);
-            commitPromotionCounter.increment();
-            totalPromotionLatencyNanos.addAndGet(promotionNanos);
-            speculationStartTimes.remove(trackingKey);
-
-            commitFuture.complete(true);
-        });
-
-        // Trigger replication
-        raftNode.triggerReplication();
-
-        // Timeout: if not committed within 10s, rollback
-        CompletableFuture.delayedExecutor(10, TimeUnit.SECONDS)
-                .execute(() -> {
-                    if (!commitFuture.isDone()) {
-                        mvccStore.rollbackVersion(key, timestamp);
-                        rollbackCounter.increment();
-                        speculationStartTimes.remove(trackingKey);
-                        commitFuture.complete(false);
-                    }
-                });
-
-        double writeLatencyMs = writeLatencyNanos / 1_000_000.0;
-        log.debug("Speculative PUT: key={}, ts={}, logIdx={}, latency={:.2f}ms",
-                key, timestamp, logIndex, writeLatencyMs);
-
-        // AckPolicy.WAIT_FOR_COMMIT: block until Raft majority confirms
-        // This still benefits from immediate reader visibility on the leader,
-        // but the writing client gets a full durability guarantee.
-        if (ackPolicy == AckPolicy.WAIT_FOR_COMMIT) {
-            try {
-                Boolean committed = commitFuture.get(5, TimeUnit.SECONDS);
-                long totalLatencyNanos = System.nanoTime() - startNanos;
-                double totalLatencyMs = totalLatencyNanos / 1_000_000.0;
-                if (committed != null && committed) {
-                    return SpeculativeResult.committedViaSpeculative(timestamp, totalLatencyMs, logIndex);
-                } else {
-                    return SpeculativeResult.failed("Raft commit failed after speculative write");
-                }
-            } catch (Exception e) {
-                // Rollback on timeout
-                mvccStore.rollbackVersion(key, timestamp);
-                rollbackCounter.increment();
-                return SpeculativeResult.failed("Timeout waiting for commit: " + e.getMessage());
-            }
-        }
-
-        return SpeculativeResult.speculative(timestamp, writeLatencyMs, logIndex, commitFuture);
+        return executeSpeculativeMutation(raftNode, RaftLog.CommandType.PUT, key, value, ackPolicy);
     }
 
     /**
@@ -321,48 +245,127 @@ public class SpeculativeManager {
         if (!speculationEnabled.get()) {
             return submitStandard(raftNode, key, null, RaftLog.CommandType.DELETE);
         }
+        return executeSpeculativeMutation(raftNode, RaftLog.CommandType.DELETE, key, null, AckPolicy.SPECULATIVE);
+    }
 
+    private SpeculativeResult executeSpeculativeMutation(RaftNode raftNode,
+                                                         RaftLog.CommandType type,
+                                                         String key,
+                                                         byte[] value,
+                                                         AckPolicy ackPolicy) {
         long startNanos = System.nanoTime();
+        MvccStore mvccStore = raftNode.getMvccStore();
+        byte[] oldValue = mvccStore.getLatestLinearizableBytes(key);
 
-        long logIndex = raftNode.appendToLog(RaftLog.CommandType.DELETE, key, null);
-        if (logIndex < 0) {
+        // Step 1: Append to Raft log atomically with deterministic timestamp + version metadata
+        RaftLog.Entry entry = raftNode.appendChronosEntry(type, key, value, "main", null, null, null);
+        if (entry == null) {
             return SpeculativeResult.failed("Not the leader or node is killed");
         }
 
-        MvccStore mvccStore = raftNode.getMvccStore();
-        long timestamp = mvccStore.deleteSpeculative(key, logIndex);
+        long logIndex = entry.index();
+        long timestamp = entry.timestamp();
+        String versionId = entry.versionId();
 
+        // Step 2: Write to MVCC store at exact leader timestamp + record SPECULATIVE ChronosVersion
+        if (type == RaftLog.CommandType.PUT) {
+            mvccStore.putSpeculativeAt(key, value, logIndex, timestamp);
+        } else {
+            mvccStore.deleteSpeculativeAt(key, logIndex, timestamp);
+        }
+
+        ChangeEntry change = type == RaftLog.CommandType.PUT
+                ? ChangeEntry.put(key, oldValue, value != null ? value : new byte[0], entry.writerId())
+                : ChangeEntry.delete(key, oldValue, entry.writerId());
+        ChronosVersion speculativeVersion = ChronosVersion.builder()
+                .versionId(versionId)
+                .sequence(entry.versionSequence())
+                .parentVersionIds(entry.parentVersionIds())
+                .branchId(entry.branchId())
+                .timestamp(timestamp)
+                .raftLogIndex(logIndex)
+                .writerId(entry.writerId())
+                .status(VersionStatus.SPECULATIVE)
+                .changeSet(List.of(change))
+                .build();
+        raftNode.getVersionCatalog().saveVersion(speculativeVersion, false);
+
+        // Step 3: Record timing & metrics
         long writeLatencyNanos = System.nanoTime() - startNanos;
         speculativeWriteTimer.record(writeLatencyNanos, TimeUnit.NANOSECONDS);
         speculativeWriteCounter.increment();
+        speculativeWriteCount.incrementAndGet();
+        totalSpeculativeLatencyNanos.addAndGet(writeLatencyNanos);
 
         String trackingKey = key + ":" + timestamp;
         speculationStartTimes.put(trackingKey, System.nanoTime());
 
+        // Step 4: Register single-fire commit & rollback callbacks
         CompletableFuture<Boolean> commitFuture = new CompletableFuture<>();
-        raftNode.trackSpeculativeCommit(logIndex, () -> {
-            long promotionNanos = System.nanoTime() - speculationStartTimes.getOrDefault(trackingKey, System.nanoTime());
-            mvccStore.commitVersion(key, timestamp);
+        AtomicBoolean resolved = new AtomicBoolean(false);
+
+        Runnable onCommit = () -> {
+            if (!resolved.compareAndSet(false, true)) return;
+            long promotionNanos = System.nanoTime()
+                    - speculationStartTimes.getOrDefault(trackingKey, System.nanoTime());
+            boolean promoted = mvccStore.commitVersion(key, timestamp);
+            if (promoted) {
+                try {
+                    raftNode.getVersionCatalog().promoteSpeculative(versionId);
+                } catch (Exception e) {
+                    log.warn("Speculative catalog promotion skipped for {}: {}", versionId, e.getMessage());
+                }
+            }
             commitPromotionTimer.record(promotionNanos, TimeUnit.NANOSECONDS);
             commitPromotionCounter.increment();
+            totalPromotionLatencyNanos.addAndGet(promotionNanos);
             speculationStartTimes.remove(trackingKey);
-            commitFuture.complete(true);
-        });
+            commitFuture.complete(promoted);
+        };
 
+        Runnable onRollback = () -> {
+            if (!resolved.compareAndSet(false, true)) return;
+            mvccStore.rollbackVersion(key, timestamp);
+            try {
+                raftNode.getVersionCatalog().rollbackSpeculative(versionId);
+            } catch (Exception e) {
+                log.debug("Speculative catalog rollback note for {}: {}", versionId, e.getMessage());
+            }
+            rollbackCounter.increment();
+            speculationStartTimes.remove(trackingKey);
+            commitFuture.complete(false);
+        };
+
+        raftNode.trackSpeculativeCommit(logIndex, onCommit, onRollback);
         raftNode.triggerReplication();
 
-        CompletableFuture.delayedExecutor(10, TimeUnit.SECONDS)
-                .execute(() -> {
-                    if (!commitFuture.isDone()) {
-                        mvccStore.rollbackVersion(key, timestamp);
-                        rollbackCounter.increment();
-                        speculationStartTimes.remove(trackingKey);
-                        commitFuture.complete(false);
-                    }
-                });
+        CompletableFuture.delayedExecutor(10, TimeUnit.SECONDS).execute(() -> {
+            if (!commitFuture.isDone()) {
+                onRollback.run();
+            }
+        });
 
         double writeLatencyMs = writeLatencyNanos / 1_000_000.0;
-        return SpeculativeResult.speculative(timestamp, writeLatencyMs, logIndex, commitFuture);
+        log.debug("Speculative {}: key={}, ts={}, versionId={}, logIdx={}, latency={:.2f}ms",
+                type, key, timestamp, versionId, logIndex, writeLatencyMs);
+
+        if (ackPolicy == AckPolicy.WAIT_FOR_COMMIT) {
+            try {
+                Boolean committed = commitFuture.get(5, TimeUnit.SECONDS);
+                long totalLatencyNanos = System.nanoTime() - startNanos;
+                double totalLatencyMs = totalLatencyNanos / 1_000_000.0;
+                if (committed != null && committed) {
+                    return SpeculativeResult.committedViaSpeculative(timestamp, totalLatencyMs, logIndex, versionId);
+                } else {
+                    return SpeculativeResult.failed("Raft commit failed after speculative write");
+                }
+            } catch (Exception e) {
+                onRollback.run();
+                return SpeculativeResult.failed("Timeout waiting for commit: " + e.getMessage());
+            }
+        }
+
+        return SpeculativeResult.speculative(timestamp, writeLatencyMs, logIndex, versionId, commitFuture);
     }
 
     /**
@@ -371,16 +374,12 @@ public class SpeculativeManager {
     private SpeculativeResult submitStandard(RaftNode raftNode, String key, byte[] value,
                                               RaftLog.CommandType type) {
         long startNanos = System.nanoTime();
-        CompletableFuture<Boolean> future;
-
-        if (type == RaftLog.CommandType.PUT) {
-            future = raftNode.submitPut(key, value);
-        } else {
-            future = raftNode.submitDelete(key);
-        }
+        CompletableFuture<RaftNode.ChronosWriteResult> future = type == RaftLog.CommandType.PUT
+                ? raftNode.submitPutWithResult(key, value)
+                : raftNode.submitDeleteWithResult(key);
 
         try {
-            Boolean committed = future.get(5, TimeUnit.SECONDS);
+            RaftNode.ChronosWriteResult result = future.get(5, TimeUnit.SECONDS);
             long latencyNanos = System.nanoTime() - startNanos;
             standardWriteTimer.record(latencyNanos, TimeUnit.NANOSECONDS);
             standardWriteCounter.increment();
@@ -389,10 +388,11 @@ public class SpeculativeManager {
 
             double latencyMs = latencyNanos / 1_000_000.0;
 
-            if (committed != null && committed) {
-                return SpeculativeResult.committed(latencyMs);
+            if (result != null && result.committed()) {
+                return SpeculativeResult.committed(latencyMs, result.timestamp(), result.raftLogIndex(), result.versionId());
             } else {
-                return SpeculativeResult.failed("Raft commit failed");
+                return SpeculativeResult.failed(result != null && result.error() != null
+                        ? result.error() : "Raft commit failed");
             }
         } catch (Exception e) {
             return SpeculativeResult.failed(e.getMessage());
@@ -473,36 +473,58 @@ public class SpeculativeManager {
             long timestamp,
             double writeLatencyMs,
             long raftLogIndex,
+            String versionId,
             String error,
             CompletableFuture<Boolean> commitFuture
     ) {
+        public SpeculativeResult(
+                boolean success,
+                boolean speculative,
+                long timestamp,
+                double writeLatencyMs,
+                long raftLogIndex,
+                String error,
+                CompletableFuture<Boolean> commitFuture) {
+            this(success, speculative, timestamp, writeLatencyMs, raftLogIndex, null, error, commitFuture);
+        }
+
         public static SpeculativeResult speculative(long timestamp, double writeLatencyMs,
                                                      long raftLogIndex,
                                                      CompletableFuture<Boolean> commitFuture) {
-            return new SpeculativeResult(true, true, timestamp, writeLatencyMs,
-                    raftLogIndex, null, commitFuture);
+            return speculative(timestamp, writeLatencyMs, raftLogIndex, null, commitFuture);
         }
 
-        /**
-         * Result of a WAIT_FOR_COMMIT speculative write: used the speculative MVCC path
-         * internally (for immediate reader visibility), but waited for Raft majority.
-         * Returned with speculative=false since the write IS committed by the time
-         * the client receives this response.
-         */
+        public static SpeculativeResult speculative(long timestamp, double writeLatencyMs,
+                                                     long raftLogIndex, String versionId,
+                                                     CompletableFuture<Boolean> commitFuture) {
+            return new SpeculativeResult(true, true, timestamp, writeLatencyMs,
+                    raftLogIndex, versionId, null, commitFuture);
+        }
+
         public static SpeculativeResult committedViaSpeculative(long timestamp, double writeLatencyMs,
                                                                   long raftLogIndex) {
+            return committedViaSpeculative(timestamp, writeLatencyMs, raftLogIndex, null);
+        }
+
+        public static SpeculativeResult committedViaSpeculative(long timestamp, double writeLatencyMs,
+                                                                  long raftLogIndex, String versionId) {
             return new SpeculativeResult(true, false, timestamp, writeLatencyMs,
-                    raftLogIndex, null, CompletableFuture.completedFuture(true));
+                    raftLogIndex, versionId, null, CompletableFuture.completedFuture(true));
         }
 
         public static SpeculativeResult committed(double writeLatencyMs) {
-            return new SpeculativeResult(true, false, 0, writeLatencyMs,
-                    0, null, CompletableFuture.completedFuture(true));
+            return committed(writeLatencyMs, 0L, 0L, null);
+        }
+
+        public static SpeculativeResult committed(double writeLatencyMs, long timestamp,
+                                                  long raftLogIndex, String versionId) {
+            return new SpeculativeResult(true, false, timestamp, writeLatencyMs,
+                    raftLogIndex, versionId, null, CompletableFuture.completedFuture(true));
         }
 
         public static SpeculativeResult failed(String error) {
             return new SpeculativeResult(false, false, 0, 0,
-                    0, error, CompletableFuture.completedFuture(false));
+                    0, null, error, CompletableFuture.completedFuture(false));
         }
     }
 }

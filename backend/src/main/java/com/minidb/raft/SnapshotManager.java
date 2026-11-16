@@ -28,6 +28,7 @@ public class SnapshotManager {
     private volatile long lastSnapshotTerm = 0;
     private volatile long lastSnapshotSize = 0;
     private volatile long lastSnapshotTime = 0;
+    private volatile long earliestRetainedRaftLogIndex = 0;
 
     // Temporary buffer for receiving snapshot chunks
     private ByteArrayOutputStream snapshotBuffer;
@@ -145,6 +146,20 @@ public class SnapshotManager {
      */
     public boolean shouldSnapshot() {
         return raftLog.getLastIndex() - lastSnapshotIndex >= config.getSnapshotInterval();
+    }
+
+    /**
+     * Record the lowest Raft log index still needed by retained Chronos versions so
+     * snapshot/log compaction aligns with the safe low-watermark.
+     */
+    public void updateRetainedRaftLogBound(long earliestRetainedIndex) {
+        if (earliestRetainedIndex > this.earliestRetainedRaftLogIndex) {
+            this.earliestRetainedRaftLogIndex = earliestRetainedIndex;
+        }
+    }
+
+    public long getEarliestRetainedRaftLogIndex() {
+        return earliestRetainedRaftLogIndex;
     }
 
     private String getSnapshotDir() {

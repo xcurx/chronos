@@ -119,26 +119,7 @@ public class RaftPeerGrpcClient implements RaftPeerClient {
                 .setLeaderCommit(leaderCommit);
 
         for (RaftLog.Entry entry : entries) {
-            CommandType protoType = switch (entry.type()) {
-                case PUT -> CommandType.PUT;
-                case DELETE -> CommandType.DELETE;
-                case TXN_PREPARE -> CommandType.TXN_PREPARE;
-                case TXN_COMMIT -> CommandType.TXN_COMMIT;
-                case TXN_ABORT -> CommandType.TXN_ABORT;
-                default -> CommandType.NOOP;
-            };
-
-            LogEntry.Builder entryBuilder = LogEntry.newBuilder()
-                    .setIndex(entry.index())
-                    .setTerm(entry.term())
-                    .setCommandType(protoType)
-                    .setKey(entry.key() != null ? entry.key() : "");
-
-            if (entry.value() != null) {
-                entryBuilder.setValue(ByteString.copyFrom(entry.value()));
-            }
-
-            builder.addEntries(entryBuilder.build());
+            builder.addEntries(RaftProtoMapper.toProtoEntry(entry));
         }
 
         CompletableFuture<RaftNode.AppendEntriesResult> future = new CompletableFuture<>();

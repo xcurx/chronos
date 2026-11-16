@@ -97,14 +97,16 @@ public class MvccStore {
      * Used by the standard Raft apply path (applyCommittedEntries).
      */
     public long put(String key, byte[] value, long timestamp) {
+        byte[] safeValue = value != null ? value : new byte[0];
+        observeTimestamp(timestamp);
         byte[] mvccKey = KeyEncoding.encode(key, timestamp);
-        byte[] encodedValue = KeyEncoding.encodeValue(value, VersionState.COMMITTED);
+        byte[] encodedValue = KeyEncoding.encodeValue(safeValue, VersionState.COMMITTED);
         storage.put(mvccKey, encodedValue);
         totalStandardWrites.incrementAndGet();
-        log.debug("MVCC PUT (committed): key={}, ts={}, valueLen={}", key, timestamp, value.length);
+        log.debug("MVCC PUT (committed): key={}, ts={}, valueLen={}", key, timestamp, safeValue.length);
 
         if (eventBus != null) {
-            eventBus.publish(ClusterEvent.mvccVersionCreated(key, timestamp, value.length));
+            eventBus.publish(ClusterEvent.mvccVersionCreated(key, timestamp, safeValue.length));
         }
         return timestamp;
     }
@@ -130,39 +132,91 @@ public class MvccStore {
      * @return the timestamp used for this speculative version
      */
     public long putSpeculative(String key, byte[] value, long raftLogIndex) {
-        long ts = nextTimestamp();
-        byte[] mvccKey = KeyEncoding.encode(key, ts);
-        byte[] encodedValue = KeyEncoding.encodeValue(value, VersionState.SPECULATIVE);
+        return putSpeculativeAt(key, value, raftLogIndex, nextTimestamp());
+    }
+
+    /**
+     * Write a speculative version at an explicit deterministic timestamp assigned by the leader.
+     */
+    public long putSpeculativeAt(String key, byte[] value, long raftLogIndex, long timestamp) {
+        byte[] safeValue = value != null ? value : new byte[0];
+        observeTimestamp(timestamp);
+        byte[] mvccKey = KeyEncoding.encode(key, timestamp);
+        byte[] encodedValue = KeyEncoding.encodeValue(safeValue, VersionState.SPECULATIVE);
         storage.put(mvccKey, encodedValue);
 
         // Track for commit promotion or rollback
-        String mvccKeyStr = key + ":" + ts;
-        speculativeVersions.put(mvccKeyStr, new SpeculativeEntry(key, ts, raftLogIndex, System.currentTimeMillis()));
+        String mvccKeyStr = key + ":" + timestamp;
+        speculativeVersions.put(mvccKeyStr, new SpeculativeEntry(key, timestamp, raftLogIndex, System.currentTimeMillis()));
         totalSpeculativeWrites.incrementAndGet();
 
-        log.debug("MVCC PUT (speculative): key={}, ts={}, raftIdx={}", key, ts, raftLogIndex);
+        log.debug("MVCC PUT (speculative): key={}, ts={}, raftIdx={}", key, timestamp, raftLogIndex);
 
         if (eventBus != null) {
-            eventBus.publish(ClusterEvent.speculativeVersionCreated(key, ts, value.length, raftLogIndex));
+            eventBus.publish(ClusterEvent.speculativeVersionCreated(key, timestamp, safeValue.length, raftLogIndex));
         }
-        return ts;
+        return timestamp;
     }
 
     /**
      * Write a speculative delete (tombstone) — applied BEFORE Raft consensus.
      */
     public long deleteSpeculative(String key, long raftLogIndex) {
-        long ts = nextTimestamp();
-        byte[] mvccKey = KeyEncoding.encode(key, ts);
+        return deleteSpeculativeAt(key, raftLogIndex, nextTimestamp());
+    }
+
+    /**
+     * Write a speculative tombstone at an explicit deterministic timestamp assigned by the leader.
+     */
+    public long deleteSpeculativeAt(String key, long raftLogIndex, long timestamp) {
+        observeTimestamp(timestamp);
+        byte[] mvccKey = KeyEncoding.encode(key, timestamp);
         byte[] encodedValue = KeyEncoding.encodeValue(TOMBSTONE_MARKER, VersionState.SPECULATIVE);
         storage.put(mvccKey, encodedValue);
 
-        String mvccKeyStr = key + ":" + ts;
-        speculativeVersions.put(mvccKeyStr, new SpeculativeEntry(key, ts, raftLogIndex, System.currentTimeMillis()));
+        String mvccKeyStr = key + ":" + timestamp;
+        speculativeVersions.put(mvccKeyStr, new SpeculativeEntry(key, timestamp, raftLogIndex, System.currentTimeMillis()));
         totalSpeculativeWrites.incrementAndGet();
 
-        log.debug("MVCC DELETE (speculative tombstone): key={}, ts={}, raftIdx={}", key, ts, raftLogIndex);
-        return ts;
+        log.debug("MVCC DELETE (speculative tombstone): key={}, ts={}, raftIdx={}", key, timestamp, raftLogIndex);
+        return timestamp;
+    }
+
+    /**
+     * Atomically write multiple key mutations at a single deterministic timestamp via RocksDB WriteBatch.
+     */
+    public void writeBatchAt(List<com.chronos.model.ChronosWritePayload.WriteOp> operations,
+                             long timestamp, VersionState state) {
+        if (operations == null || operations.isEmpty()) {
+            return;
+        }
+        observeTimestamp(timestamp);
+        List<Map.Entry<byte[], byte[]>> entries = new ArrayList<>(operations.size());
+        for (com.chronos.model.ChronosWritePayload.WriteOp op : operations) {
+            byte[] mvccKey = KeyEncoding.encode(op.getKey(), timestamp);
+            byte[] rawPayload = op.getOpType() == com.chronos.model.OperationType.DELETE
+                    ? TOMBSTONE_MARKER
+                    : (op.getValue() != null ? op.getValue() : new byte[0]);
+            entries.add(Map.entry(mvccKey, KeyEncoding.encodeValue(rawPayload, state)));
+        }
+        storage.writeBatch(entries);
+        if (state == VersionState.COMMITTED) {
+            totalStandardWrites.addAndGet(operations.size());
+            if (eventBus != null) {
+                for (com.chronos.model.ChronosWritePayload.WriteOp op : operations) {
+                    int len = op.getValue() != null ? op.getValue().length : 0;
+                    eventBus.publish(ClusterEvent.mvccVersionCreated(op.getKey(), timestamp, len));
+                }
+            }
+        }
+    }
+
+    /**
+     * Read current latest committed bytes for a key, or {@code null} if absent or tombstoned.
+     */
+    public byte[] getLatestLinearizableBytes(String key) {
+        MvccResult current = get(key, Long.MAX_VALUE, ReadMode.LINEARIZABLE);
+        return (current != null && current.isFound()) ? current.getValue() : null;
     }
 
     /**
@@ -349,6 +403,7 @@ public class MvccStore {
      * Delete a key at a specific timestamp (committed).
      */
     public long delete(String key, long timestamp) {
+        observeTimestamp(timestamp);
         byte[] mvccKey = KeyEncoding.encode(key, timestamp);
         byte[] encodedValue = KeyEncoding.encodeValue(TOMBSTONE_MARKER, VersionState.COMMITTED);
         storage.put(mvccKey, encodedValue);
@@ -449,13 +504,22 @@ public class MvccStore {
     // ================================================================
 
     /**
-     * Garbage collect old versions. Extended to also purge ROLLED_BACK versions
-     * immediately (no retention needed — they are already invisible).
+     * Garbage collect obsolete MVCC versions using a time retention window.
+     * Purges {@code ROLLED_BACK} versions at any position (including index 0) and
+     * preserves both the latest committed version and the watermark-boundary version per key.
      *
      * @return number of versions purged
      */
     public int garbageCollect(long retentionMs) {
         long cutoffTimestamp = System.currentTimeMillis() - retentionMs;
+        return garbageCollectAtCutoff(cutoffTimestamp, true);
+    }
+
+    /**
+     * Garbage collect {@code ROLLED_BACK} MVCC entries everywhere and optionally purge
+     * obsolete {@code COMMITTED} versions strictly older than the safe watermark boundary.
+     */
+    public int garbageCollectAtCutoff(long cutoffTimestamp, boolean purgeCommittedBeforeCutoff) {
         int purged = 0;
 
         byte[] startKey = new byte[]{0};
@@ -466,6 +530,10 @@ public class MvccStore {
         for (Map.Entry<byte[], byte[]> entry : entries) {
             try {
                 String userKey = KeyEncoding.decodeUserKey(entry.getKey());
+                if (userKey.startsWith("__")) {
+                    continue;
+                }
+                KeyEncoding.decodeTimestamp(entry.getKey());
                 keyVersions.computeIfAbsent(userKey, k -> new ArrayList<>()).add(entry.getKey());
             } catch (Exception e) {
                 // Skip non-MVCC keys
@@ -474,26 +542,49 @@ public class MvccStore {
 
         for (Map.Entry<String, List<byte[]>> kv : keyVersions.entrySet()) {
             List<byte[]> versions = kv.getValue();
-            if (versions.size() <= 1) continue;
+            boolean keptLatestCommitted = false;
+            boolean keptBoundaryAtOrBelowCutoff = false;
 
-            for (int i = 1; i < versions.size(); i++) {
+            // versions are ordered newest -> oldest (inverted timestamp key order)
+            for (byte[] mvccKeyBytes : versions) {
                 try {
-                    byte[] mvccKeyBytes = versions.get(i);
                     long ts = KeyEncoding.decodeTimestamp(mvccKeyBytes);
                     byte[] rawValue = storage.get(mvccKeyBytes);
+                    if (rawValue == null) {
+                        continue;
+                    }
+                    VersionState state = KeyEncoding.decodeVersionState(rawValue);
 
-                    if (rawValue != null) {
-                        VersionState state = KeyEncoding.decodeVersionState(rawValue);
-
-                        // Always purge ROLLED_BACK versions immediately
-                        if (state == VersionState.ROLLED_BACK) {
-                            storage.delete(mvccKeyBytes);
-                            purged++;
-                            continue;
-                        }
+                    // Always purge ROLLED_BACK entries regardless of position (fixes index-0 leak)
+                    if (state == VersionState.ROLLED_BACK) {
+                        storage.delete(mvccKeyBytes);
+                        purged++;
+                        continue;
                     }
 
-                    // Standard retention-based cleanup for committed versions
+                    if (state != VersionState.COMMITTED) {
+                        // Never purge SPECULATIVE in-flight writes
+                        continue;
+                    }
+
+                    if (!keptLatestCommitted) {
+                        keptLatestCommitted = true;
+                        if (purgeCommittedBeforeCutoff && ts <= cutoffTimestamp) {
+                            keptBoundaryAtOrBelowCutoff = true;
+                        }
+                        continue;
+                    }
+
+                    if (!purgeCommittedBeforeCutoff) {
+                        continue;
+                    }
+
+                    // Preserve the newest committed version at or below cutoffTimestamp (rule #5)
+                    if (ts <= cutoffTimestamp && !keptBoundaryAtOrBelowCutoff) {
+                        keptBoundaryAtOrBelowCutoff = true;
+                        continue;
+                    }
+
                     if (ts < cutoffTimestamp) {
                         storage.delete(mvccKeyBytes);
                         purged++;
@@ -519,7 +610,20 @@ public class MvccStore {
     // ================================================================
 
     public long nextTimestamp() {
-        return timestampGenerator.incrementAndGet();
+        return timestampGenerator.updateAndGet(prev -> Math.max(System.currentTimeMillis(), prev + 1));
+    }
+
+    /**
+     * Advance local timestamp generator when applying a deterministic Raft-assigned timestamp.
+     */
+    public void observeTimestamp(long timestamp) {
+        if (timestamp > 0) {
+            timestampGenerator.accumulateAndGet(timestamp, Math::max);
+        }
+    }
+
+    public long getLastTimestamp() {
+        return timestampGenerator.get();
     }
 
     /**
