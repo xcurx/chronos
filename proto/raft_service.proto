@@ -35,6 +35,12 @@ message LogEntry {
   string key = 4;
   bytes value = 5;
   string txn_id = 6;
+  int64 timestamp = 7;
+  string version_id = 8;
+  int64 version_sequence = 9;
+  string branch_id = 10;
+  string writer_id = 11;
+  repeated string parent_version_ids = 12;
 }
 
 enum CommandType {
@@ -44,6 +50,10 @@ enum CommandType {
   TXN_PREPARE = 3;
   TXN_COMMIT = 4;
   TXN_ABORT = 5;
+  CHRONOS_WRITE = 6;
+  CHRONOS_TXN = 7;
+  CHRONOS_BRANCH_WRITE = 8;
+  CHRONOS_MERGE = 9;
 }
 
 message AppendEntriesRequest {

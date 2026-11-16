@@ -24,6 +24,12 @@ service KvService {
   rpc SpeculativePut(SpeculativePutRequest) returns (SpeculativePutResponse);
   // Speculative delete: writes tombstone immediately, returns before consensus
   rpc SpeculativeDelete(SpeculativeDeleteRequest) returns (SpeculativePutResponse);
+
+  // ---- Chronos Time-Travel & Audit ----
+  rpc GetAsOfVersion(TemporalKeyRequest) returns (TemporalKeyResponse);
+  rpc GetAsOfTime(TemporalKeyRequest) returns (TemporalKeyResponse);
+  rpc ReconstructState(ReconstructStateRequest) returns (ReconstructStateResponse);
+  rpc GetAuditHistory(AuditHistoryRequest) returns (AuditHistoryResponse);
 }
 
 message PutRequest {
@@ -96,4 +102,74 @@ message SpeculativePutResponse {
   int64 raft_log_index = 4;     // Raft log index for commit tracking
   double write_latency_ms = 5;  // Local write latency in milliseconds
   string error = 6;
+}
+
+// ---- Chronos Time-Travel & Audit Messages ----
+
+message TemporalKeyRequest {
+  string key = 1;
+  string version_id = 2;
+  string timestamp = 3;
+  string snapshot_id = 4;
+  string branch_id = 5;
+  bool consistent = 6;
+}
+
+message TemporalKeyResponse {
+  bool found = 1;
+  bytes value = 2;
+  bool tombstone = 3;
+  bool speculative = 4;
+  string version_id = 5;
+  int64 version_sequence = 6;
+  int64 timestamp = 7;
+  string branch_id = 8;
+  string writer_id = 9;
+  string error = 10;
+  string error_code = 11;
+}
+
+message ReconstructStateRequest {
+  string mode = 1; // CURRENT, AS_OF_VERSION, AS_OF_TIME, AS_OF_SNAPSHOT
+  string version_id = 2;
+  string timestamp = 3;
+  string snapshot_id = 4;
+  string branch_id = 5;
+  string prefix = 6;
+  int32 limit = 7;
+  bool consistent = 8;
+}
+
+message ReconstructStateResponse {
+  string version_id = 1;
+  int64 version_sequence = 2;
+  int64 timestamp = 3;
+  string branch_id = 4;
+  repeated KvPair pairs = 5;
+  string error = 6;
+  string error_code = 7;
+}
+
+message AuditHistoryRequest {
+  string key = 1;
+  bool include_uncommitted = 2;
+}
+
+message AuditEntryProto {
+  string version_id = 1;
+  int64 version_sequence = 2;
+  int64 timestamp = 3;
+  string branch_id = 4;
+  string status = 5;
+  string operation_type = 6;
+  string old_value = 7;
+  string new_value = 8;
+  string writer_id = 9;
+  string transaction_id = 10;
+}
+
+message AuditHistoryResponse {
+  string key = 1;
+  repeated AuditEntryProto entries = 2;
+  string error = 3;
 }
