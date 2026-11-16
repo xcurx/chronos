@@ -85,7 +85,7 @@ export default function TopologyView() {
         const isUp = found.isUp !== false;
         const isAlive = found.isAlive !== false;
         const isPartitioned = found.isPartitioned === true;
-        const role = found.role || 'FOLLOWER';
+        const role = (found.isLeader ? 'LEADER' : found.role) || (id === clusterStatus?.leaderId ? 'LEADER' : 'FOLLOWER');
 
         let statusLabel: string = role;
         let statusColor: string = ROLE_COLORS[role] || ROLE_COLORS.FOLLOWER;
@@ -103,6 +103,8 @@ export default function TopologyView() {
 
         return {
           ...found,
+          role,
+          term: found.term ?? clusterStatus?.term,
           isUp,
           isAlive,
           isPartitioned,
@@ -114,15 +116,17 @@ export default function TopologyView() {
       // Also check peerHealth from clusterStatus for peers not in nodes array
       const peerHealthAlive = clusterStatus?.peerHealth?.[id];
       const isPartitioned = clusterStatus?.partitionedPeers?.includes(id) ?? false;
+      const isLeader = id === clusterStatus?.leaderId;
+      const role = isLeader ? 'LEADER' : 'FOLLOWER';
 
       if (peerHealthAlive === false) {
-        return { id, isUp: false, isAlive: false, isPartitioned, statusLabel: 'DEAD', statusColor: DOWN_COLOR };
+        return { id, role, term: clusterStatus?.term, isUp: false, isAlive: false, isPartitioned, statusLabel: 'DEAD', statusColor: DOWN_COLOR };
       }
       if (isPartitioned) {
-        return { id, isUp: false, isAlive: true, isPartitioned: true, statusLabel: 'PARTITIONED', statusColor: PARTITIONED_COLOR };
+        return { id, role, term: clusterStatus?.term, isUp: false, isAlive: true, isPartitioned: true, statusLabel: 'PARTITIONED', statusColor: PARTITIONED_COLOR };
       }
 
-      return { id, isUp: true, isAlive: true, isPartitioned: false, statusLabel: 'FOLLOWER', statusColor: ROLE_COLORS.FOLLOWER };
+      return { id, role, term: clusterStatus?.term, isUp: true, isAlive: true, isPartitioned: false, statusLabel: role, statusColor: ROLE_COLORS[role] || ROLE_COLORS.FOLLOWER };
     },
     [nodes, clusterStatus],
   );
@@ -154,15 +158,31 @@ export default function TopologyView() {
     dMerge.append('feMergeNode').attr('in', 'redBlur');
     dMerge.append('feMergeNode').attr('in', 'SourceGraphic');
 
-    // Line glow
-    const lineGlow = defs.append('filter').attr('id', 'lineGlow').attr('x', '-20%').attr('y', '-20%').attr('width', '140%').attr('height', '140%');
-    lineGlow.append('feGaussianBlur').attr('stdDeviation', '2').attr('result', 'blur');
+    // Line glow with userSpaceOnUse to avoid zero-dimension clipping on horizontal/vertical lines
+    const lineGlow = defs.append('filter')
+      .attr('id', 'lineGlow')
+      .attr('filterUnits', 'userSpaceOnUse')
+      .attr('x', 0)
+      .attr('y', 0)
+      .attr('width', width)
+      .attr('height', height);
+    lineGlow.append('feGaussianBlur').attr('stdDeviation', '2.5').attr('result', 'blur');
     const lMerge = lineGlow.append('feMerge');
     lMerge.append('feMergeNode').attr('in', 'blur');
     lMerge.append('feMergeNode').attr('in', 'SourceGraphic');
 
-    const nodeIds = allNodeIds();
-    if (nodeIds.length === 0) return;
+    const rawNodeIds = allNodeIds();
+    if (rawNodeIds.length === 0) return;
+
+    // Detect leader ID to place it at the top apex (angle -PI/2)
+    const leaderId =
+      clusterStatus?.leaderId ||
+      nodes.find((n) => n.role === 'LEADER' || n.isLeader)?.id ||
+      (clusterStatus?.role === 'LEADER' ? clusterStatus.nodeId : undefined);
+
+    const nodeIds = leaderId && rawNodeIds.includes(leaderId)
+      ? [leaderId, ...rawNodeIds.filter((id) => id !== leaderId).sort()]
+      : rawNodeIds;
 
     const cx = width / 2;
     const cy = height / 2;
@@ -197,24 +217,36 @@ export default function TopologyView() {
 
         const eitherDead = !aAlive || !bAlive;
 
+        const isLeaderEdge = Boolean(
+          leaderId && (a.id === leaderId || b.id === leaderId)
+        );
+
         let strokeColor = 'rgba(99, 102, 241, 0.2)';
         let strokeWidth = 1;
         let dashArray = 'none';
 
         if (eitherDead) {
           // One or both nodes down → red dashed line
-          strokeColor = 'rgba(239, 68, 68, 0.4)';
+          strokeColor = 'rgba(239, 68, 68, 0.45)';
           strokeWidth = 1.5;
           dashArray = '6,4';
         } else if (isPartitioned) {
           // Partitioned → orange dashed
-          strokeColor = 'rgba(249, 115, 22, 0.5)';
+          strokeColor = 'rgba(249, 115, 22, 0.55)';
           strokeWidth = 1.5;
           dashArray = '8,6';
         } else if (bothAlive) {
-          // Both alive → green solid
-          strokeColor = 'rgba(34, 197, 94, 0.3)';
-          strokeWidth = 1.5;
+          if (isLeaderEdge) {
+            // Leader <-> Follower active replication stream → solid emerald green
+            strokeColor = 'rgba(34, 197, 94, 0.45)';
+            strokeWidth = 2;
+            dashArray = 'none';
+          } else {
+            // Follower <-> Follower peer mesh → subtle standby dashed link
+            strokeColor = 'rgba(99, 102, 241, 0.22)';
+            strokeWidth = 1.2;
+            dashArray = '4,4';
+          }
         }
 
         edgeGroup
@@ -224,7 +256,7 @@ export default function TopologyView() {
           .attr('stroke', strokeColor)
           .attr('stroke-width', strokeWidth)
           .attr('stroke-dasharray', dashArray)
-          .attr('filter', bothAlive && !isPartitioned ? 'url(#lineGlow)' : 'none');
+          .attr('filter', bothAlive && isLeaderEdge && !isPartitioned ? 'url(#lineGlow)' : 'none');
 
         // "X" marker on dead connections
         if (eitherDead) {
@@ -243,9 +275,9 @@ export default function TopologyView() {
       }
     }
 
-    // ──── Heartbeat pulse animations (only between alive, non-partitioned nodes) ────
+    // ──── Heartbeat pulse animations (only along active leader replication streams) ────
     const leaderNode = nodePositions.find(
-      (n) => n.info.statusLabel === 'LEADER' || (n.id === clusterStatus?.leaderId && n.info.isAlive !== false),
+      (n) => n.id === leaderId || n.info.statusLabel === 'LEADER' || n.info.role === 'LEADER',
     );
     if (leaderNode && leaderNode.info.isAlive !== false) {
       nodePositions
@@ -253,20 +285,20 @@ export default function TopologyView() {
         .forEach((follower) => {
           const marker = edgeGroup
             .append('circle')
-            .attr('r', 3)
+            .attr('r', 3.5)
             .attr('fill', '#22c55e')
             .attr('opacity', 0);
 
           const animateP = () => {
             marker
               .attr('cx', leaderNode.x).attr('cy', leaderNode.y)
-              .attr('opacity', 0.8)
-              .transition().duration(1400).ease(d3.easeQuadOut)
+              .attr('opacity', 0.85)
+              .transition().duration(1300).ease(d3.easeQuadOut)
               .attr('cx', follower.x).attr('cy', follower.y)
               .attr('opacity', 0)
               .on('end', () => setTimeout(animateP, 600 + Math.random() * 500));
           };
-          setTimeout(animateP, Math.random() * 1200);
+          setTimeout(animateP, Math.random() * 1000);
         });
     }
 
@@ -466,7 +498,19 @@ export default function TopologyView() {
       .attr('font-family', 'Inter, sans-serif')
       .text('NODES ALIVE');
 
-  }, [allNodeIds, getNodeInfo, clusterStatus]);
+  }, [allNodeIds, getNodeInfo, clusterStatus, nodes]);
+
+  // Determine sorted node IDs for display cards (Leader first)
+  const displayNodeIds = (() => {
+    const rawIds = allNodeIds();
+    const leaderId =
+      clusterStatus?.leaderId ||
+      nodes.find((n) => n.role === 'LEADER' || n.isLeader)?.id ||
+      (clusterStatus?.role === 'LEADER' ? clusterStatus.nodeId : undefined);
+    return leaderId && rawIds.includes(leaderId)
+      ? [leaderId, ...rawIds.filter((id) => id !== leaderId).sort()]
+      : rawIds;
+  })();
 
   return (
     <div className="h-full flex flex-col gap-4">
@@ -494,7 +538,7 @@ export default function TopologyView() {
 
       {/* Node status cards */}
       <div className="grid grid-cols-3 gap-3">
-        {allNodeIds().map((id) => {
+        {displayNodeIds.map((id) => {
           const info = getNodeInfo(id);
           const isDown = info.isAlive === false || info.isUp === false;
           const isLeader = info.statusLabel === 'LEADER';

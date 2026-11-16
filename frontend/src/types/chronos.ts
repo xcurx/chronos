@@ -114,8 +114,10 @@ export interface DagEdge {
 export interface VersionDagResponse {
   nodes: DagNode[];
   edges: DagEdge[];
-  totalNodes: number;
-  totalEdges: number;
+  totalNodes?: number;
+  totalEdges?: number;
+  nodeCount?: number;
+  edgeCount?: number;
   lcaCandidate?: string;
 }
 

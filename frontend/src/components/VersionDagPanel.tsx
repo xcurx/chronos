@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import * as d3 from 'd3';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useClusterStore } from '../stores/clusterStore';
 import type {
@@ -13,7 +14,8 @@ import type {
 import {
   GitFork, GitMerge, GitBranch, Plus, Play, RefreshCw,
   Loader2, CheckCircle2, AlertTriangle, XCircle, ArrowRight,
-  ShieldAlert, Sparkles, Layers, User, Clock, ChevronRight, X
+  ShieldAlert, Sparkles, Layers, User, Clock, ChevronRight, X,
+  ZoomIn, ZoomOut, Maximize2, Crosshair
 } from 'lucide-react';
 
 function getApiBase() {
@@ -50,6 +52,15 @@ export default function VersionDagPanel() {
   // Demo Running State
   const [demoRunning, setDemoRunning] = useState(false);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
+
+  // Graph viewer refs and interactive zoom state
+  const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<SVGGElement>(null);
+  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const hasInitialFitRef = useRef(false);
+  const [zoomScale, setZoomScale] = useState(1.0);
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
   const fetchDagAndBranches = useCallback(async () => {
     setLoading(true);
@@ -289,26 +300,225 @@ export default function VersionDagPanel() {
     }
   };
 
-  // Node positioning for SVG DAG
+  // Node positioning for SVG DAG using smart topological interval lane allocation
   const layoutNodes = useMemo(() => {
-    if (!dag?.nodes) return [];
-    // Sort chronological
+    if (!dag?.nodes || dag.nodes.length === 0) return [];
+    // Sort chronological by sequence
     const sorted = [...dag.nodes].sort((a, b) => a.sequence - b.sequence);
-    const branchLanes: Record<string, number> = { main: 0 };
-    let laneCounter = 1;
 
-    sorted.forEach((n) => {
-      if (branchLanes[n.branchId] === undefined) {
-        branchLanes[n.branchId] = laneCounter++;
+    // Calculate index intervals [start, end] for each branch
+    const intervals: Record<string, [number, number]> = {};
+    sorted.forEach((n, idx) => {
+      const b = n.branchId || 'main';
+      if (!intervals[b]) {
+        intervals[b] = [idx, idx];
+      } else {
+        intervals[b][1] = idx;
       }
     });
 
+    // Extend branch lifespan if a merge commit references this branch as parent
+    sorted.forEach((n, idx) => {
+      if (n.isMerge && n.parentVersionIds) {
+        n.parentVersionIds.forEach((pId) => {
+          const parentNode = sorted.find((m) => m.versionId === pId);
+          if (parentNode && parentNode.branchId && parentNode.branchId !== 'main') {
+            if (intervals[parentNode.branchId]) {
+              intervals[parentNode.branchId][1] = Math.max(intervals[parentNode.branchId][1], idx);
+            }
+          }
+        });
+      }
+    });
+
+    // main is always lane 0
+    const branchLanes: Record<string, number> = { main: 0 };
+    const laneOccupiedUntil: Record<number, number> = { 0: Infinity };
+
+    // Sort non-main branches by their start index
+    const otherBranches = Object.keys(intervals)
+      .filter((b) => b !== 'main')
+      .sort((a, b) => intervals[a][0] - intervals[b][0]);
+
+    otherBranches.forEach((b) => {
+      const [start, end] = intervals[b];
+      let lane = 1;
+      while (laneOccupiedUntil[lane] !== undefined && laneOccupiedUntil[lane] >= start) {
+        lane++;
+      }
+      branchLanes[b] = lane;
+      laneOccupiedUntil[lane] = end;
+    });
+
+    const LANE_HEIGHT = 70;
+    const NODE_SPACING_X = 110;
+
     return sorted.map((n, idx) => ({
       ...n,
-      x: 80 + idx * 110,
-      y: 60 + (branchLanes[n.branchId] || 0) * 85,
+      x: 80 + idx * NODE_SPACING_X,
+      y: 60 + (branchLanes[n.branchId] ?? 0) * LANE_HEIGHT,
+      lane: branchLanes[n.branchId] ?? 0,
     }));
   }, [dag]);
+
+  // Helper to ensure zoom behavior is initialized and attached
+  const ensureZoom = useCallback(() => {
+    if (!svgRef.current || !contentRef.current) return null;
+    if (zoomBehaviorRef.current) return zoomBehaviorRef.current;
+
+    const svg = d3.select(svgRef.current);
+    const content = d3.select(contentRef.current);
+
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.15, 3.0])
+      .on('zoom', (event) => {
+        content.attr('transform', event.transform);
+        setZoomScale(event.transform.k);
+      });
+
+    zoomBehaviorRef.current = zoom;
+    svg.call(zoom);
+    svg.on('dblclick.zoom', null);
+    return zoom;
+  }, []);
+
+  // Setup D3 zoom and pan on mount and whenever canvas mounts
+  useEffect(() => {
+    ensureZoom();
+  }, [ensureZoom, layoutNodes.length]);
+
+  // Fit all nodes comfortably into the screen
+  const fitToScreen = useCallback((animate = true) => {
+    if (!svgRef.current || !contentRef.current || !containerRef.current || layoutNodes.length === 0) return;
+    const zoom = ensureZoom();
+    if (!zoom) return;
+
+    const container = containerRef.current;
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 450;
+    if (width <= 0 || height <= 0) return;
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const node of layoutNodes) {
+      minX = Math.min(minX, node.x - 30);
+      maxX = Math.max(maxX, node.x + 30);
+      minY = Math.min(minY, node.y - 30);
+      maxY = Math.max(maxY, node.y + 55);
+    }
+
+    const graphWidth = Math.max(100, maxX - minX);
+    const graphHeight = Math.max(100, maxY - minY);
+
+    const paddingX = 80;
+    const paddingY = 60;
+    const scaleX = (width - paddingX * 2) / graphWidth;
+    const scaleY = (height - paddingY * 2) / graphHeight;
+    const targetScale = Math.min(1.15, Math.max(0.18, Math.min(scaleX, scaleY)));
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    const tx = width / 2 - centerX * targetScale;
+    const ty = height / 2 - centerY * targetScale;
+
+    const transform = d3.zoomIdentity.translate(tx, ty).scale(targetScale);
+    const svg = d3.select(svgRef.current);
+
+    if (animate) {
+      svg.transition()
+        .duration(600)
+        .ease(d3.easeCubicOut)
+        .call(zoom.transform, transform);
+    } else {
+      svg.call(zoom.transform, transform);
+    }
+  }, [layoutNodes, ensureZoom]);
+
+  // Auto-fit on initial node layout load
+  useEffect(() => {
+    if (layoutNodes.length > 0) {
+      const t = setTimeout(() => fitToScreen(false), 80);
+      return () => clearTimeout(t);
+    }
+  }, [layoutNodes.length, fitToScreen]);
+
+  // Center view on a specific node
+  const focusNode = useCallback((node: typeof layoutNodes[0]) => {
+    if (!svgRef.current || !containerRef.current) return;
+    const zoom = ensureZoom();
+    if (!zoom) return;
+
+    const cw = containerRef.current.clientWidth || 800;
+    const ch = containerRef.current.clientHeight || 450;
+    const currentK = zoomScale || 1.0;
+    const targetK = Math.max(currentK, 0.85);
+    const tx = cw / 2 - node.x * targetK;
+    const ty = ch / 2 - node.y * targetK;
+
+    d3.select(svgRef.current)
+      .transition()
+      .duration(500)
+      .ease(d3.easeCubicOut)
+      .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(targetK));
+  }, [zoomScale, ensureZoom]);
+
+  // Zoom controls
+  const handleZoomIn = () => {
+    if (!svgRef.current) return;
+    const zoom = ensureZoom();
+    if (!zoom) return;
+    d3.select(svgRef.current)
+      .transition()
+      .duration(250)
+      .ease(d3.easeQuadOut)
+      .call(zoom.scaleBy, 1.3);
+  };
+
+  const handleZoomOut = () => {
+    if (!svgRef.current) return;
+    const zoom = ensureZoom();
+    if (!zoom) return;
+    d3.select(svgRef.current)
+      .transition()
+      .duration(250)
+      .ease(d3.easeQuadOut)
+      .call(zoom.scaleBy, 1 / 1.3);
+  };
+
+  // Connected edges for hover highlighting
+  const connectedEdgeSet = useMemo(() => {
+    const activeId = hoveredNodeId || selectedNode?.versionId;
+    if (!activeId || !dag?.edges) return new Set<string>();
+
+    const set = new Set<string>();
+    dag.edges.forEach((edge) => {
+      if (edge.childVersionId === activeId || edge.parentVersionId === activeId) {
+        set.add(`${edge.childVersionId}->${edge.parentVersionId}`);
+      }
+    });
+    return set;
+  }, [hoveredNodeId, selectedNode, dag]);
+
+  // Edge curve generation
+  const getEdgePath = (source: { x: number; y: number }, target: { x: number; y: number }) => {
+    const x1 = source.x;
+    const y1 = source.y;
+    const x2 = target.x;
+    const y2 = target.y;
+
+    if (y1 === y2) {
+      return `M ${x1} ${y1} L ${x2} ${y2}`;
+    }
+
+    const dx = Math.abs(x1 - x2);
+    const curvature = Math.min(55, Math.max(25, dx * 0.45));
+    const cp1x = x1 - curvature;
+    const cp1y = y1;
+    const cp2x = x2 + curvature;
+    const cp2y = y2;
+
+    return `M ${x1} ${y1} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${x2} ${y2}`;
+  };
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-surface-950 p-6 space-y-5">
@@ -396,34 +606,63 @@ export default function VersionDagPanel() {
       )}
 
       {/* Main Workspace: Visual DAG + Inspector */}
-      <div className="flex-1 flex gap-5 overflow-hidden">
+      <div className="flex-1 flex gap-5 overflow-hidden min-h-0">
         {/* SVG DAG Visualizer */}
-        <div className="flex-1 bg-surface-900/60 border border-white/[0.06] rounded-2xl p-4 backdrop-blur-xl flex flex-col overflow-hidden">
-          <div className="flex items-center justify-between pb-3 border-b border-white/[0.06]">
+        <div className="flex-1 bg-surface-900/60 border border-white/[0.06] rounded-2xl p-4 backdrop-blur-xl flex flex-col overflow-hidden relative">
+          <div className="flex items-center justify-between pb-3 border-b border-white/[0.06] z-10">
             <div className="flex items-center gap-2 text-xs">
               <span className="font-bold text-white uppercase tracking-wider">Version DAG Graph</span>
-              <span className="text-white/40">({dag?.totalNodes ?? 0} versions, {dag?.totalEdges ?? 0} edges)</span>
+              <span className="text-white/40">
+                ({dag?.nodeCount ?? dag?.nodes?.length ?? 0} versions, {dag?.edgeCount ?? dag?.edges?.length ?? 0} edges)
+              </span>
             </div>
-            <button
-              onClick={fetchDagAndBranches}
-              className="text-white/40 hover:text-white p-1 rounded-lg hover:bg-white/[0.04]"
-              title="Refresh DAG"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => fitToScreen(true)}
+                className="text-white/50 hover:text-white px-2.5 py-1 rounded-lg hover:bg-white/[0.04] border border-white/[0.06] text-[11px] flex items-center gap-1.5 transition"
+                title="Fit graph to viewport"
+              >
+                <Maximize2 className="w-3 h-3 text-purple-400" />
+                <span>Fit View</span>
+              </button>
+              <button
+                onClick={fetchDagAndBranches}
+                className="text-white/40 hover:text-white p-1 rounded-lg hover:bg-white/[0.04]"
+                title="Refresh DAG"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
-          <div className="flex-1 overflow-auto relative p-4 flex items-center justify-center">
-            {layoutNodes.length > 0 ? (
-              <svg width={Math.max(800, layoutNodes.length * 120 + 100)} height={350} className="overflow-visible">
-                <defs>
-                  <marker id="arrow" viewBox="0 0 10 10" refX="18" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="rgba(255,255,255,0.25)" />
-                  </marker>
-                  <marker id="arrow-merge" viewBox="0 0 10 10" refX="18" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7" />
-                  </marker>
-                </defs>
+          <div
+            ref={containerRef}
+            className="flex-1 relative overflow-hidden bg-surface-950/60 rounded-xl mt-3 select-none"
+          >
+            <svg
+              ref={svgRef}
+              className="w-full h-full cursor-grab active:cursor-grabbing block"
+              style={{ touchAction: 'none' }}
+            >
+              <defs>
+                <pattern id="dag-grid-pattern" width="36" height="36" patternUnits="userSpaceOnUse">
+                  <circle cx="18" cy="18" r="1" fill="rgba(255,255,255,0.06)" />
+                </pattern>
+                <marker id="arrow" viewBox="0 0 10 10" refX="22" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="rgba(255,255,255,0.3)" />
+                </marker>
+                <marker id="arrow-merge" viewBox="0 0 10 10" refX="26" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc" />
+                </marker>
+              </defs>
+
+              {/* Background event-capturing plane */}
+              <rect width="100%" height="100%" fill="transparent" pointerEvents="all" />
+
+              {/* Zooming / Panning Content Group */}
+              <g ref={contentRef}>
+                {/* Infinite Pan/Zoom Grid Background */}
+                <rect x={-10000} y={-10000} width={20000} height={20000} fill="url(#dag-grid-pattern)" pointerEvents="none" />
 
                 {/* Render Directed Edges */}
                 {dag?.edges?.map((edge, idx) => {
@@ -431,19 +670,29 @@ export default function VersionDagPanel() {
                   const target = layoutNodes.find((n) => n.versionId === edge.parentVersionId);
                   if (!source || !target) return null;
 
+                  const edgeKey = `${edge.childVersionId}->${edge.parentVersionId}`;
+                  const isHighlighted = connectedEdgeSet.has(edgeKey);
+                  const hasActiveHover = Boolean(hoveredNodeId || selectedNode);
                   const isMergeEdge = source.isMerge;
 
+                  const strokeColor = isHighlighted
+                    ? isMergeEdge ? '#d8b4fe' : '#34d399'
+                    : isMergeEdge ? '#a855f7' : 'rgba(255,255,255,0.2)';
+
+                  const strokeWidth = isHighlighted ? (isMergeEdge ? 3 : 2.5) : (isMergeEdge ? 2 : 1.5);
+                  const opacity = hasActiveHover && !isHighlighted ? 0.22 : 1;
+
                   return (
-                    <line
+                    <path
                       key={idx}
-                      x1={source.x}
-                      y1={source.y}
-                      x2={target.x}
-                      y2={target.y}
-                      stroke={isMergeEdge ? '#a855f7' : 'rgba(255,255,255,0.2)'}
-                      strokeWidth={isMergeEdge ? 2 : 1.5}
-                      strokeDasharray={isMergeEdge ? '4 2' : undefined}
+                      d={getEdgePath(source, target)}
+                      fill="none"
+                      stroke={strokeColor}
+                      strokeWidth={strokeWidth}
+                      strokeDasharray={isMergeEdge ? '5 3' : undefined}
                       markerEnd={isMergeEdge ? 'url(#arrow-merge)' : 'url(#arrow)'}
+                      opacity={opacity}
+                      className="transition-all duration-200"
                     />
                   );
                 })}
@@ -451,6 +700,7 @@ export default function VersionDagPanel() {
                 {/* Render DAG Nodes */}
                 {layoutNodes.map((node) => {
                   const isSelected = selectedNode?.versionId === node.versionId;
+                  const isHovered = hoveredNodeId === node.versionId;
                   const isMain = node.branchId === 'main';
                   const isMerge = node.isMerge;
 
@@ -459,8 +709,22 @@ export default function VersionDagPanel() {
                       key={node.versionId}
                       transform={`translate(${node.x}, ${node.y})`}
                       onClick={() => setSelectedNode(node)}
+                      onMouseEnter={() => setHoveredNodeId(node.versionId)}
+                      onMouseLeave={() => setHoveredNodeId(null)}
                       className="cursor-pointer group"
                     >
+                      {/* Node Halo / Selection Ring */}
+                      {(isSelected || isHovered) && (
+                        <circle
+                          r={isMerge ? 26 : 22}
+                          fill="none"
+                          stroke={isMerge ? '#c084fc' : isMain ? '#34d399' : '#818cf8'}
+                          strokeWidth={1.5}
+                          strokeDasharray="3 3"
+                          opacity={isSelected ? 0.8 : 0.4}
+                        />
+                      )}
+
                       {/* Node Circle */}
                       <circle
                         r={isMerge ? 19 : 15}
@@ -508,16 +772,59 @@ export default function VersionDagPanel() {
                     </g>
                   );
                 })}
-              </svg>
-            ) : (
-              <div className="text-center text-white/40 text-xs">
+              </g>
+            </svg>
+
+            {/* Empty or loading state overlay */}
+            {layoutNodes.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-center text-white/40 text-xs pointer-events-none">
                 {loading ? 'Loading version graph...' : 'No versions in DAG yet.'}
               </div>
+            )}
+
+            {/* Floating Zoom and Pan Controls */}
+            {layoutNodes.length > 0 && (
+              <>
+                <div className="absolute bottom-4 right-4 z-20 flex items-center gap-1 bg-surface-900/90 border border-white/10 rounded-xl px-2 py-1.5 shadow-2xl backdrop-blur-md">
+                  <button
+                    onClick={handleZoomIn}
+                    className="p-1.5 text-white/70 hover:text-white hover:bg-white/10 rounded-lg transition active:scale-95"
+                    title="Zoom In (+)"
+                  >
+                    <ZoomIn className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="text-[10px] font-mono text-white/70 min-w-[36px] text-center select-none font-medium">
+                    {Math.round(zoomScale * 100)}%
+                  </span>
+                  <button
+                    onClick={handleZoomOut}
+                    className="p-1.5 text-white/70 hover:text-white hover:bg-white/10 rounded-lg transition active:scale-95"
+                    title="Zoom Out (-)"
+                  >
+                    <ZoomOut className="w-3.5 h-3.5" />
+                  </button>
+                  <div className="w-px h-3.5 bg-white/10 mx-0.5" />
+                  <button
+                    onClick={() => fitToScreen(true)}
+                    className="p-1.5 text-purple-300 hover:text-white hover:bg-purple-500/20 rounded-lg transition active:scale-95"
+                    title="Fit to Screen"
+                  >
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                {/* Navigation Hint */}
+                <div className="absolute bottom-4 left-4 z-20 pointer-events-none text-[10px] text-white/30 font-medium flex items-center gap-1.5">
+                  <span>🖱 Drag to Pan</span>
+                  <span>•</span>
+                  <span>Scroll to Zoom</span>
+                </div>
+              </>
             )}
           </div>
 
           {/* Graph Legend */}
-          <div className="flex items-center justify-center gap-6 pt-3 border-t border-white/[0.06] text-[11px] text-white/50">
+          <div className="flex items-center justify-center gap-6 pt-3 mt-1 border-t border-white/[0.06] text-[11px] text-white/50">
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full bg-emerald-500/40 border border-emerald-400" />
               <span>Main Lineage</span>
@@ -542,11 +849,23 @@ export default function VersionDagPanel() {
                   <span className="text-[10px] text-white/40 uppercase tracking-wider block">Selected Version</span>
                   <h3 className="text-sm font-bold text-white font-mono">{selectedNode.versionId}</h3>
                 </div>
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                  selectedNode.isMerge ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-emerald-500/20 text-emerald-300'
-                }`}>
-                  {selectedNode.isMerge ? 'MERGE COMMIT' : 'COMMIT'}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => {
+                      const found = layoutNodes.find((n) => n.versionId === selectedNode.versionId);
+                      if (found) focusNode(found);
+                    }}
+                    className="p-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-white/60 hover:text-white transition"
+                    title="Center on this node in graph"
+                  >
+                    <Crosshair className="w-3.5 h-3.5 text-purple-400" />
+                  </button>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    selectedNode.isMerge ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-emerald-500/20 text-emerald-300'
+                  }`}>
+                    {selectedNode.isMerge ? 'MERGE COMMIT' : 'COMMIT'}
+                  </span>
+                </div>
               </div>
 
               <div className="space-y-2">
@@ -578,7 +897,9 @@ export default function VersionDagPanel() {
                 )}
                 <div className="flex justify-between py-1">
                   <span className="text-white/40">Mutations Count:</span>
-                  <span className="font-mono text-white/90">{selectedNode.changeCount}</span>
+                  <span className="font-mono text-white/90">
+                    {selectedNode.changeCount ?? (selectedNode as any).changeSet?.length ?? 0}
+                  </span>
                 </div>
               </div>
             </div>
