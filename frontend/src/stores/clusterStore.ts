@@ -79,7 +79,7 @@ export const useClusterStore = create<ClusterStore>((set) => ({
   metricsHistory: [],
   activeTab: 'topology',
   darkMode: true,
-  eventFilters: new Set(['RAFT', 'REPLICATION', 'KV', 'HEARTBEAT', 'SNAPSHOT', 'TXN']),
+  eventFilters: new Set(['RAFT', 'REPLICATION', 'KV', 'HEARTBEAT', 'SNAPSHOT', 'TXN', 'CHRONOS']),
   connected: false,
   apiBaseUrl: '',
 

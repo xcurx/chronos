@@ -5,7 +5,7 @@ import type { ClusterEvent, EventCategory } from '../types/events';
 import {
   Shield, ArrowUpDown, Database, HeartPulse, Camera,
   GitBranch, Clock, Flame, Search, ChevronDown,
-  ChevronRight, Radio, Filter, X
+  ChevronRight, Radio, Filter, X, History
 } from 'lucide-react';
 
 const CATEGORY_CONFIG: Record<EventCategory, { icon: typeof Shield; color: string; accent: string }> = {
@@ -17,6 +17,7 @@ const CATEGORY_CONFIG: Record<EventCategory, { icon: typeof Shield; color: strin
   TXN:         { icon: GitBranch,  color: 'text-cyan-400',   accent: 'bg-cyan-500/10 border-cyan-500/10' },
   MVCC:        { icon: Clock,      color: 'text-orange-400', accent: 'bg-orange-500/10 border-orange-500/10' },
   CHAOS:       { icon: Flame,      color: 'text-red-400',    accent: 'bg-red-500/10 border-red-500/10' },
+  CHRONOS:     { icon: History,    color: 'text-indigo-400', accent: 'bg-indigo-500/10 border-indigo-500/10' },
 };
 
 export default function EventTimeline() {

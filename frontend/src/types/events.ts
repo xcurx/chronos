@@ -154,7 +154,8 @@ export type EventCategory =
   | 'SNAPSHOT'
   | 'TXN'
   | 'MVCC'
-  | 'CHAOS';
+  | 'CHAOS'
+  | 'CHRONOS';
 
 export interface ClusterEvent {
   id: string;

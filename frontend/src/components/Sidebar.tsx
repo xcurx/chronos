@@ -4,7 +4,7 @@ import {
   Crown, Users, Hash, GitCommitHorizontal, Timer,
   Activity, Server, ArrowUpDown, Shield, Zap,
   Database, HardDrive, Radio, AlertTriangle, Skull,
-  HeartPulse, Gauge, CircleDot
+  HeartPulse, Gauge, CircleDot, History
 } from 'lucide-react';
 
 const EVENT_ICONS: Record<string, typeof Crown> = {
@@ -16,6 +16,7 @@ const EVENT_ICONS: Record<string, typeof Crown> = {
   TXN: Zap,
   MVCC: GitCommitHorizontal,
   CHAOS: AlertTriangle,
+  CHRONOS: History,
 };
 
 const EVENT_COLORS: Record<string, string> = {
@@ -27,6 +28,7 @@ const EVENT_COLORS: Record<string, string> = {
   TXN: 'text-cyan-400',
   MVCC: 'text-orange-400',
   CHAOS: 'text-red-400',
+  CHRONOS: 'text-indigo-400',
 };
 
 const ROLE_BADGES: Record<string, { color: string; bg: string; icon: typeof Crown; gradient: string }> = {

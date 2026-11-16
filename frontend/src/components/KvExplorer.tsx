@@ -95,7 +95,7 @@ export default function KvExplorer() {
     setExpandedKey(k);
     try {
       const res = await fetch(`${getApiBase()}/kv/versions/${encodeURIComponent(k)}`);
-      if (res.ok) { const data = await res.json(); setVersions(data || []); }
+      if (res.ok) { const data = await res.json(); setVersions(Array.isArray(data) ? data : (data.versions || [])); }
     } catch { setVersions([]); }
   };
 

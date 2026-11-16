@@ -10,13 +10,18 @@ import MetricsDashboard from './components/MetricsDashboard';
 import EventTimeline from './components/EventTimeline';
 import ChaosPanel from './components/ChaosPanel';
 import SpeculationPanel from './components/SpeculationPanel';
+import TimeTravelPanel from './components/TimeTravelPanel';
+import VersionDagPanel from './components/VersionDagPanel';
 import {
   Network, ScrollText, Database, BarChart3, Radio, Flame,
   WifiOff, ChevronDown, Server, Skull, Activity, Zap,
+  History, GitFork,
 } from 'lucide-react';
 
 const TABS = [
   { id: 'topology', label: 'Topology', icon: Network, description: 'Cluster visualization' },
+  { id: 'time-travel', label: 'Time Travel', icon: History, description: 'Point-in-time state reconstruction & key audit' },
+  { id: 'dag', label: 'Version DAG', icon: GitFork, description: 'Lineage graph, branching & merge studio' },
   { id: 'logs', label: 'Raft Log', icon: ScrollText, description: 'Consensus log entries' },
   { id: 'kv', label: 'KV Store', icon: Database, description: 'Key-value operations' },
   { id: 'speculation', label: 'Speculation', icon: Zap, description: 'Speculative MVCC Consensus' },
@@ -49,6 +54,8 @@ function App() {
   const renderContent = () => {
     switch (activeTab) {
       case 'topology': return <TopologyView />;
+      case 'time-travel': return <TimeTravelPanel />;
+      case 'dag': return <VersionDagPanel />;
       case 'logs': return <RaftLogViewer />;
       case 'kv': return <KvExplorer />;
       case 'speculation': return <SpeculationPanel />;
@@ -97,8 +104,8 @@ function App() {
               {isKilled && <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-red-500 border-2 border-surface-950" />}
             </div>
             <div>
-              <h1 className="text-sm font-bold tracking-tight bg-gradient-to-r from-white to-white/80 bg-clip-text text-transparent">MiniDB</h1>
-              <p className="text-[10px] text-white/25 -mt-0.5 font-medium">Distributed Database</p>
+              <h1 className="text-sm font-bold tracking-tight bg-gradient-to-r from-white to-white/80 bg-clip-text text-transparent">Chronos</h1>
+              <p className="text-[10px] text-white/25 -mt-0.5 font-medium">Distributed Time-Travel Database</p>
             </div>
           </div>
 
