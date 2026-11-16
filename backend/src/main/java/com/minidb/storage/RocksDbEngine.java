@@ -108,6 +108,36 @@ public class RocksDbEngine implements StorageEngine {
     }
 
     @Override
+    public List<Map.Entry<byte[], byte[]>> scanReverse(byte[] minKeyInclusive, byte[] upperBoundExclusive, int limit) {
+        checkOpen();
+        List<Map.Entry<byte[], byte[]>> results = new ArrayList<>();
+        try (RocksIterator iter = db.newIterator()) {
+            if (upperBoundExclusive != null) {
+                iter.seekForPrev(upperBoundExclusive);
+                while (iter.isValid() && compareBytes(iter.key(), upperBoundExclusive) >= 0) {
+                    iter.prev();
+                }
+            } else {
+                iter.seekToLast();
+            }
+            int count = 0;
+            while (iter.isValid()) {
+                byte[] key = iter.key();
+                if (minKeyInclusive != null && compareBytes(key, minKeyInclusive) < 0) {
+                    break;
+                }
+                if (limit > 0 && count >= limit) {
+                    break;
+                }
+                results.add(Map.entry(key, iter.value()));
+                count++;
+                iter.prev();
+            }
+        }
+        return results;
+    }
+
+    @Override
     public void writeBatch(List<Map.Entry<byte[], byte[]>> entries) {
         checkOpen();
         try (WriteBatch batch = new WriteBatch();

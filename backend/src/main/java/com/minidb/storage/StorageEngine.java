@@ -31,6 +31,25 @@ public interface StorageEngine {
     List<Map.Entry<byte[], byte[]>> scan(byte[] startKey, byte[] endKey, int limit);
 
     /**
+     * Reverse range scan from upperBoundExclusive downwards to minKeyInclusive.
+     * Results are returned in descending key order. If limit <= 0, returns all matches.
+     */
+    default List<Map.Entry<byte[], byte[]>> scanReverse(byte[] minKeyInclusive, byte[] upperBoundExclusive, int limit) {
+        List<Map.Entry<byte[], byte[]>> ascending = scan(
+                minKeyInclusive != null ? minKeyInclusive : new byte[0],
+                upperBoundExclusive,
+                0);
+        java.util.ArrayList<Map.Entry<byte[], byte[]>> reversed = new java.util.ArrayList<>();
+        for (int i = ascending.size() - 1; i >= 0; i--) {
+            reversed.add(ascending.get(i));
+            if (limit > 0 && reversed.size() >= limit) {
+                break;
+            }
+        }
+        return reversed;
+    }
+
+    /**
      * Write a batch of key-value pairs atomically.
      */
     void writeBatch(List<Map.Entry<byte[], byte[]>> entries);
