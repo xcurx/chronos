@@ -224,6 +224,7 @@ public class KvController {
         } else {
             result.put("error", specResult.error());
         }
+        eventBus.publish(ClusterEvent.kvOperation("PUT", key, (long) specResult.writeLatencyMs(), specResult.success()));
         return result;
     }
 
@@ -261,6 +262,7 @@ public class KvController {
         } else {
             result.put("error", specResult.error());
         }
+        eventBus.publish(ClusterEvent.kvOperation("DELETE", key, (long) specResult.writeLatencyMs(), specResult.success()));
         return result;
     }
 
@@ -272,6 +274,18 @@ public class KvController {
         boolean enabled = Boolean.TRUE.equals(request.get("enabled"));
         speculativeManager.setSpeculationEnabled(enabled);
 
+        if (!raftNode.isLeader()) {
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> forwarded = forwardToLeader("/api/kv/speculation/toggle", mapper.writeValueAsString(request));
+                if (forwarded != null && !forwarded.isEmpty()) {
+                    return forwarded;
+                }
+            } catch (Exception e) {
+                log.warn("Forwarding /api/kv/speculation/toggle failed: {}", e.getMessage());
+            }
+        }
+
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("speculationEnabled", speculativeManager.isSpeculationEnabled());
         return result;
@@ -282,6 +296,25 @@ public class KvController {
      */
     @GetMapping("/speculation/metrics")
     public Map<String, Object> speculationMetrics() {
+        if (!raftNode.isLeader()) {
+            String leaderUrl = getLeaderHttpUrl();
+            if (leaderUrl != null) {
+                try {
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(URI.create(leaderUrl + "/api/kv/speculation/metrics"))
+                            .GET()
+                            .timeout(Duration.ofSeconds(3))
+                            .build();
+                    HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                    if (response.statusCode() == 200) {
+                        return parseJson(response.body());
+                    }
+                } catch (Exception e) {
+                    log.debug("Leader speculation metrics fetch failed, fallback to local: {}", e.getMessage());
+                }
+            }
+        }
+
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("speculationEnabled", speculativeManager.isSpeculationEnabled());
         result.put("avgSpeculativeLatencyMs", speculativeManager.getAverageSpeculativeLatencyMs());
@@ -417,6 +450,7 @@ public class KvController {
             result.put("pairs", pairs);
             result.put("count", pairs.size());
             result.put("latencyMs", latency);
+            eventBus.publish(ClusterEvent.kvOperation("SCAN", startKey, latency, true));
         } catch (Exception e) {
             result.put("error", e.getMessage());
         }

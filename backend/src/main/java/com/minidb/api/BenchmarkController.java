@@ -1,14 +1,21 @@
 package com.minidb.api;
 
+import com.minidb.config.RaftConfig;
 import com.minidb.mvcc.MvccStore;
 import com.minidb.raft.RaftLog;
 import com.minidb.raft.RaftNode;
 import com.minidb.speculation.SpeculativeManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -54,10 +61,60 @@ public class BenchmarkController {
 
     private final RaftNode raftNode;
     private final SpeculativeManager speculativeManager;
+    private final RaftConfig raftConfig;
+    private final HttpClient httpClient;
 
-    public BenchmarkController(RaftNode raftNode, SpeculativeManager speculativeManager) {
+    public BenchmarkController(RaftNode raftNode, SpeculativeManager speculativeManager,
+                               @Autowired(required = false) RaftConfig raftConfig) {
         this.raftNode = raftNode;
         this.speculativeManager = speculativeManager;
+        this.raftConfig = raftConfig;
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+    }
+
+    private String getLeaderHttpUrl() {
+        String leaderId = raftNode.getLeaderId();
+        if (leaderId == null || raftConfig == null || raftConfig.getPeers() == null) return null;
+        for (String peer : raftConfig.getPeers()) {
+            String peerNodeId = peer.contains("@") ? peer.split("@")[0] : peer;
+            if (peerNodeId.equals(leaderId)) {
+                String address = peer.contains("@") ? peer.split("@")[1] : peer;
+                String[] parts = address.split(":");
+                String host = parts[0];
+                int grpcPort = parts.length > 1 ? Integer.parseInt(parts[1]) : 9090;
+                int httpPort = grpcPort - 1010;
+                return "http://" + host + ":" + httpPort;
+            }
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> forwardToLeader(String path, String jsonBody) {
+        String leaderUrl = getLeaderHttpUrl();
+        if (leaderUrl == null) {
+            Map<String, Object> err = new LinkedHashMap<>();
+            err.put("error", "No leader available in cluster (current node " + raftNode.getNodeId() + " is FOLLOWER)");
+            return err;
+        }
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(leaderUrl + path))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                    .timeout(Duration.ofSeconds(60))
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            return mapper.readValue(response.body(), LinkedHashMap.class);
+        } catch (Exception e) {
+            log.warn("Failed forwarding to leader at {}: {}", leaderUrl, e.getMessage());
+            Map<String, Object> err = new LinkedHashMap<>();
+            err.put("error", "Failed forwarding benchmark to leader (" + leaderUrl + "): " + e.getMessage());
+            return err;
+        }
     }
 
     /**
@@ -91,7 +148,17 @@ public class BenchmarkController {
         results.put("baselineOptimizations", baselineInfo);
 
         if (!raftNode.isLeader()) {
-            results.put("error", "Must run benchmark on leader node");
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> forwarded = forwardToLeader("/api/benchmark/run", mapper.writeValueAsString(request));
+                if (forwarded != null && !forwarded.isEmpty()) {
+                    return forwarded;
+                }
+            } catch (Exception e) {
+                log.warn("Forwarding /api/benchmark/run failed: {}", e.getMessage());
+            }
+            results.put("error", "Must run benchmark on leader node (current: " + raftNode.getNodeId()
+                    + ", leader: " + (raftNode.getLeaderId() != null ? raftNode.getLeaderId() : "none") + ")");
             return results;
         }
 
@@ -117,48 +184,52 @@ public class BenchmarkController {
         // Disable speculation for this run, but keep batching for fairness
         boolean wasEnabled = speculativeManager.isSpeculationEnabled();
         speculativeManager.setSpeculationEnabled(false);
+        try {
+            List<Long> latencies = Collections.synchronizedList(new ArrayList<>());
+            AtomicLong successCount = new AtomicLong(0);
+            AtomicLong failCount = new AtomicLong(0);
 
-        List<Long> latencies = Collections.synchronizedList(new ArrayList<>());
-        AtomicLong successCount = new AtomicLong(0);
-        AtomicLong failCount = new AtomicLong(0);
+            ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+            long startTime = System.nanoTime();
 
-        ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-        long startTime = System.nanoTime();
-
-        List<Future<?>> futures = new ArrayList<>();
-        for (int i = 0; i < numOps; i++) {
-            final String key = "bench-std-" + i;
-            futures.add(executor.submit(() -> {
-                long opStart = System.nanoTime();
-                try {
-                    Boolean committed = raftNode.submitPut(key, value)
-                            .get(10, TimeUnit.SECONDS);
-                    long latencyNanos = System.nanoTime() - opStart;
-                    latencies.add(latencyNanos);
-                    if (committed != null && committed) {
-                        successCount.incrementAndGet();
-                    } else {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < numOps; i++) {
+                final String key = "bench-std-" + i;
+                futures.add(executor.submit(() -> {
+                    long opStart = System.nanoTime();
+                    try {
+                        Boolean committed = raftNode.submitPut(key, value)
+                                .get(10, TimeUnit.SECONDS);
+                        long latencyNanos = System.nanoTime() - opStart;
+                        latencies.add(latencyNanos);
+                        if (committed != null && committed) {
+                            successCount.incrementAndGet();
+                            if (speculativeManager != null) {
+                                speculativeManager.recordStandardWrite(latencyNanos);
+                            }
+                        } else {
+                            failCount.incrementAndGet();
+                        }
+                    } catch (Exception e) {
                         failCount.incrementAndGet();
                     }
-                } catch (Exception e) {
-                    failCount.incrementAndGet();
-                }
-            }));
+                }));
+            }
+
+            // Wait for all ops
+            for (Future<?> f : futures) {
+                try { f.get(30, TimeUnit.SECONDS); } catch (Exception e) { /* ignore */ }
+            }
+
+            long totalTimeNanos = System.nanoTime() - startTime;
+            executor.shutdown();
+
+            return buildLatencyReport("standard (optimized: batching=0.5ms)", latencies, totalTimeNanos,
+                    successCount.get(), failCount.get(), numOps);
+        } finally {
+            // Restore speculation state
+            speculativeManager.setSpeculationEnabled(wasEnabled);
         }
-
-        // Wait for all ops
-        for (Future<?> f : futures) {
-            try { f.get(30, TimeUnit.SECONDS); } catch (Exception e) { /* ignore */ }
-        }
-
-        long totalTimeNanos = System.nanoTime() - startTime;
-        executor.shutdown();
-
-        // Restore speculation state
-        speculativeManager.setSpeculationEnabled(wasEnabled);
-
-        return buildLatencyReport("standard (optimized: batching=0.5ms)", latencies, totalTimeNanos,
-                successCount.get(), failCount.get(), numOps);
     }
 
     /**
@@ -176,97 +247,97 @@ public class BenchmarkController {
     private Map<String, Object> runSpeculativeBenchmark(int numOps, int concurrency, byte[] value) {
         boolean wasEnabled = speculativeManager.isSpeculationEnabled();
         speculativeManager.setSpeculationEnabled(true);
+        try {
+            List<Long> latencies = Collections.synchronizedList(new ArrayList<>());
+            List<Long> promotionLatencies = Collections.synchronizedList(new ArrayList<>());
+            List<CompletableFuture<Boolean>> allCommitFutures = Collections.synchronizedList(new ArrayList<>());
+            AtomicLong successCount = new AtomicLong(0);
+            AtomicLong failCount = new AtomicLong(0);
+            AtomicLong promotionSuccessCount = new AtomicLong(0);
+            AtomicLong promotionFailCount = new AtomicLong(0);
 
-        List<Long> latencies = Collections.synchronizedList(new ArrayList<>());
-        List<Long> promotionLatencies = Collections.synchronizedList(new ArrayList<>());
-        List<CompletableFuture<Boolean>> allCommitFutures = Collections.synchronizedList(new ArrayList<>());
-        AtomicLong successCount = new AtomicLong(0);
-        AtomicLong failCount = new AtomicLong(0);
-        AtomicLong promotionSuccessCount = new AtomicLong(0);
-        AtomicLong promotionFailCount = new AtomicLong(0);
+            ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+            long startTime = System.nanoTime();
 
-        ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-        long startTime = System.nanoTime();
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < numOps; i++) {
+                final String key = "bench-spec-" + i;
+                futures.add(executor.submit(() -> {
+                    long opStart = System.nanoTime();
+                    SpeculativeManager.SpeculativeResult result =
+                            speculativeManager.submitSpeculativePut(raftNode, key, value);
 
-        List<Future<?>> futures = new ArrayList<>();
-        for (int i = 0; i < numOps; i++) {
-            final String key = "bench-spec-" + i;
-            futures.add(executor.submit(() -> {
-                long opStart = System.nanoTime();
-                SpeculativeManager.SpeculativeResult result =
-                        speculativeManager.submitSpeculativePut(raftNode, key, value);
+                    long writeLatencyNanos = System.nanoTime() - opStart;
+                    latencies.add(writeLatencyNanos);
 
-                long writeLatencyNanos = System.nanoTime() - opStart;
-                latencies.add(writeLatencyNanos);
+                    if (result.success()) {
+                        successCount.incrementAndGet();
 
-                if (result.success()) {
-                    successCount.incrementAndGet();
-
-                    // Track commit promotion — measure from when write completed
-                    if (result.commitFuture() != null && !result.commitFuture().isDone()) {
-                        long promoStart = System.nanoTime();
-                        CompletableFuture<Boolean> trackedFuture = result.commitFuture().whenComplete((committed, ex) -> {
-                            long promoLatency = System.nanoTime() - promoStart;
-                            promotionLatencies.add(promoLatency);
-                            if (committed != null && committed) {
-                                promotionSuccessCount.incrementAndGet();
-                            } else {
-                                promotionFailCount.incrementAndGet();
-                            }
-                        });
-                        allCommitFutures.add(trackedFuture);
+                        // Track commit promotion — measure from when write completed
+                        if (result.commitFuture() != null && !result.commitFuture().isDone()) {
+                            long promoStart = System.nanoTime();
+                            CompletableFuture<Boolean> trackedFuture = result.commitFuture().whenComplete((committed, ex) -> {
+                                long promoLatency = System.nanoTime() - promoStart;
+                                promotionLatencies.add(promoLatency);
+                                if (committed != null && committed) {
+                                    promotionSuccessCount.incrementAndGet();
+                                } else {
+                                    promotionFailCount.incrementAndGet();
+                                }
+                            });
+                            allCommitFutures.add(trackedFuture);
+                        } else {
+                            // Already committed (immediate promotion)
+                            promotionLatencies.add(0L);
+                            promotionSuccessCount.incrementAndGet();
+                        }
                     } else {
-                        // Already committed (immediate promotion)
-                        promotionLatencies.add(0L);
-                        promotionSuccessCount.incrementAndGet();
+                        failCount.incrementAndGet();
                     }
-                } else {
-                    failCount.incrementAndGet();
-                }
-            }));
-        }
-
-        // Wait for all writes to be submitted
-        for (Future<?> f : futures) {
-            try { f.get(30, TimeUnit.SECONDS); } catch (Exception e) { /* ignore */ }
-        }
-
-        long writePhaseNanos = System.nanoTime() - startTime;
-
-        // Wait for ALL promotions to complete (up to 15s) — critical for accurate metrics
-        if (!allCommitFutures.isEmpty()) {
-            try {
-                CompletableFuture.allOf(allCommitFutures.toArray(new CompletableFuture[0]))
-                        .get(15, TimeUnit.SECONDS);
-            } catch (Exception e) {
-                log.warn("Some promotions did not complete within 15s: {}", e.getMessage());
+                }));
             }
+
+            // Wait for all writes to be submitted
+            for (Future<?> f : futures) {
+                try { f.get(30, TimeUnit.SECONDS); } catch (Exception e) { /* ignore */ }
+            }
+
+            long writePhaseNanos = System.nanoTime() - startTime;
+
+            // Wait for ALL promotions to complete (up to 15s) — critical for accurate metrics
+            if (!allCommitFutures.isEmpty()) {
+                try {
+                    CompletableFuture.allOf(allCommitFutures.toArray(new CompletableFuture[0]))
+                            .get(15, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    log.warn("Some promotions did not complete within 15s: {}", e.getMessage());
+                }
+            }
+
+            long totalTimeNanos = System.nanoTime() - startTime;
+            executor.shutdown();
+
+            // Write latency report — this is the CLIENT-VISIBLE latency
+            Map<String, Object> report = buildLatencyReport("speculative", latencies,
+                    writePhaseNanos, successCount.get(), failCount.get(), numOps);
+
+            // Promotion latency stats — this is the BACKGROUND consensus latency
+            if (!promotionLatencies.isEmpty()) {
+                report.put("promotionLatency", buildPercentileStats(promotionLatencies));
+            }
+
+            // Promotion success rate for this benchmark run
+            long totalPromoted = promotionSuccessCount.get();
+            long totalFailed = promotionFailCount.get();
+            report.put("promotionSuccessCount", totalPromoted);
+            report.put("promotionFailCount", totalFailed);
+            report.put("promotionSuccessRate", (totalPromoted + totalFailed) > 0
+                    ? (double) totalPromoted / (totalPromoted + totalFailed) : 1.0);
+
+            return report;
+        } finally {
+            speculativeManager.setSpeculationEnabled(wasEnabled);
         }
-
-        long totalTimeNanos = System.nanoTime() - startTime;
-        executor.shutdown();
-
-        speculativeManager.setSpeculationEnabled(wasEnabled);
-
-        // Write latency report — this is the CLIENT-VISIBLE latency
-        Map<String, Object> report = buildLatencyReport("speculative", latencies,
-                writePhaseNanos, successCount.get(), failCount.get(), numOps);
-
-        // Promotion latency stats — this is the BACKGROUND consensus latency
-        if (!promotionLatencies.isEmpty()) {
-            report.put("promotionLatency", buildPercentileStats(promotionLatencies));
-        }
-
-        // Promotion success rate for this benchmark run
-        long totalPromoted = promotionSuccessCount.get();
-        long totalFailed = promotionFailCount.get();
-        report.put("promotionSuccessCount", totalPromoted);
-        report.put("promotionFailCount", totalFailed);
-        report.put("promotionSuccessRate",
-                (totalPromoted + totalFailed) > 0
-                        ? (double) totalPromoted / (totalPromoted + totalFailed) : 0.0);
-
-        return report;
     }
 
     /**
@@ -327,7 +398,17 @@ public class BenchmarkController {
         Map<String, Object> result = new LinkedHashMap<>();
 
         if (!raftNode.isLeader()) {
-            result.put("error", "Must run on leader node");
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> forwarded = forwardToLeader("/api/benchmark/rollback-benchmark", mapper.writeValueAsString(request));
+                if (forwarded != null && !forwarded.isEmpty()) {
+                    return forwarded;
+                }
+            } catch (Exception e) {
+                log.warn("Forwarding /api/benchmark/rollback-benchmark failed: {}", e.getMessage());
+            }
+            result.put("error", "Must run on leader node (current: " + raftNode.getNodeId()
+                    + ", leader: " + (raftNode.getLeaderId() != null ? raftNode.getLeaderId() : "none") + ")");
             return result;
         }
 
@@ -392,7 +473,17 @@ public class BenchmarkController {
         Map<String, Object> result = new LinkedHashMap<>();
 
         if (!raftNode.isLeader()) {
-            result.put("error", "Must run on leader node");
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> forwarded = forwardToLeader("/api/benchmark/gc-stress", mapper.writeValueAsString(request));
+                if (forwarded != null && !forwarded.isEmpty()) {
+                    return forwarded;
+                }
+            } catch (Exception e) {
+                log.warn("Forwarding /api/benchmark/gc-stress failed: {}", e.getMessage());
+            }
+            result.put("error", "Must run on leader node (current: " + raftNode.getNodeId()
+                    + ", leader: " + (raftNode.getLeaderId() != null ? raftNode.getLeaderId() : "none") + ")");
             return result;
         }
 
@@ -534,6 +625,25 @@ public class BenchmarkController {
      */
     @GetMapping("/comparison")
     public Map<String, Object> getComparison() {
+        if (!raftNode.isLeader()) {
+            String leaderUrl = getLeaderHttpUrl();
+            if (leaderUrl != null) {
+                try {
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(URI.create(leaderUrl + "/api/benchmark/comparison"))
+                            .GET()
+                            .timeout(Duration.ofSeconds(5))
+                            .build();
+                    HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                    if (response.statusCode() == 200) {
+                        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                        return mapper.readValue(response.body(), LinkedHashMap.class);
+                    }
+                } catch (Exception e) {
+                    log.debug("Forwarding /api/benchmark/comparison failed: {}", e.getMessage());
+                }
+            }
+        }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("avgSpeculativeLatencyMs", speculativeManager.getAverageSpeculativeLatencyMs());
         result.put("avgStandardLatencyMs", speculativeManager.getAverageStandardLatencyMs());
@@ -579,12 +689,23 @@ public class BenchmarkController {
         Map<String, Object> result = new LinkedHashMap<>();
 
         if (!raftNode.isLeader()) {
-            result.put("error", "Must run on leader node");
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> forwarded = forwardToLeader("/api/benchmark/latency-breakdown", mapper.writeValueAsString(request));
+                if (forwarded != null && !forwarded.isEmpty()) {
+                    return forwarded;
+                }
+            } catch (Exception e) {
+                log.warn("Forwarding /api/benchmark/latency-breakdown failed: {}", e.getMessage());
+            }
+            result.put("error", "Must run on leader node (current: " + raftNode.getNodeId()
+                    + ", leader: " + (raftNode.getLeaderId() != null ? raftNode.getLeaderId() : "none") + ")");
             return result;
         }
 
         boolean wasEnabled = speculativeManager.isSpeculationEnabled();
         speculativeManager.setSpeculationEnabled(true);
+        try {
 
         byte[] value = new byte[valueSizeBytes];
         Arrays.fill(value, (byte) 'b');
@@ -666,7 +787,6 @@ public class BenchmarkController {
         }
 
         executor.shutdown();
-        speculativeManager.setSpeculationEnabled(wasEnabled);
 
         // Build breakdown report
         result.put("numOps", numOps);
@@ -697,7 +817,10 @@ public class BenchmarkController {
         result.put("promotionRate", total > 0 ? (double) promoted / total : 0.0);
 
         return result;
+    } finally {
+        speculativeManager.setSpeculationEnabled(wasEnabled);
     }
+}
 
     /**
      * Build percentile stats in MICROSECONDS for sub-millisecond phase breakdown.

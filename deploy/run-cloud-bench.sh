@@ -5,7 +5,7 @@ set -e
 LEADER_PORT=8081
 
 echo "=== Finding Leader ==="
-for port in 8081 8082 8083; do
+for port in 8080 8082 8084 8081 8083; do
     STATUS=$(curl -s http://localhost:$port/api/cluster/status 2>/dev/null || echo '{}')
     IS_LEADER=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('role',''))" 2>/dev/null || echo "")
     if [ "$IS_LEADER" = "LEADER" ]; then
