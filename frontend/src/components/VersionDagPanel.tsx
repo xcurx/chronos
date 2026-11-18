@@ -82,15 +82,21 @@ export default function VersionDagPanel() {
 
       if (dagRes) {
         setDag(dagRes);
-        if (!selectedNode && dagRes.nodes?.length > 0) {
-          setSelectedNode(dagRes.nodes[0]);
-        }
+        setSelectedNode((prev) => {
+          if (!prev && dagRes.nodes?.length > 0) {
+            return dagRes.nodes[0];
+          }
+          if (prev && dagRes.nodes?.some((n: DagNode) => n.versionId === prev.versionId)) {
+            return prev;
+          }
+          return dagRes.nodes?.[0] || null;
+        });
       }
       if (branchRes?.branches) {
         setBranches(branchRes.branches);
         const nonMain = branchRes.branches.filter((b: ChronosBranch) => b.branchId !== 'main');
-        if (nonMain.length > 0 && !mergeSource) {
-          setMergeSource(nonMain[0].branchId);
+        if (nonMain.length > 0) {
+          setMergeSource((prev) => prev || nonMain[0].branchId);
         }
       }
     } catch (err: any) {
@@ -98,7 +104,7 @@ export default function VersionDagPanel() {
     } finally {
       setLoading(false);
     }
-  }, [selectedNode, mergeSource]);
+  }, []);
 
   useEffect(() => {
     fetchDagAndBranches();
@@ -513,9 +519,12 @@ export default function VersionDagPanel() {
     }
   }, [layoutNodes, ensureZoom]);
 
-  // Auto-fit on initial node layout load
+  const initialFitDoneRef = useRef(false);
+
+  // Auto-fit on initial node layout load only once
   useEffect(() => {
-    if (layoutNodes.length > 0) {
+    if (layoutNodes.length > 0 && !initialFitDoneRef.current) {
+      initialFitDoneRef.current = true;
       const t = setTimeout(() => fitToScreen(false), 80);
       return () => clearTimeout(t);
     }
@@ -727,11 +736,30 @@ export default function VersionDagPanel() {
                 <pattern id="dag-grid-pattern" width="36" height="36" patternUnits="userSpaceOnUse">
                   <circle cx="18" cy="18" r="1" fill="rgba(255,255,255,0.06)" />
                 </pattern>
-                <marker id="arrow" viewBox="0 0 10 10" refX="22" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M 0 1 L 10 5 L 0 9 z" fill="rgba(255,255,255,0.3)" />
+
+                {/* Default Edge Arrow */}
+                <marker id="arrow-default" viewBox="0 0 10 10" refX="22" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#64748b" />
                 </marker>
-                <marker id="arrow-merge" viewBox="0 0 10 10" refX="26" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc" />
+
+                {/* Default Merge Edge Arrow */}
+                <marker id="arrow-merge-default" viewBox="0 0 10 10" refX="26" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#a855f7" />
+                </marker>
+
+                {/* Highlighted Main Lineage Arrow (Emerald) */}
+                <marker id="arrow-highlight-main" viewBox="0 0 10 10" refX="22" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 1 L 9 5 L 0 9 z" fill="#34d399" />
+                </marker>
+
+                {/* Highlighted Branch Lineage Arrow (Sky/Cyan) */}
+                <marker id="arrow-highlight-branch" viewBox="0 0 10 10" refX="22" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 1 L 9 5 L 0 9 z" fill="#38bdf8" />
+                </marker>
+
+                {/* Highlighted Merge Edge Arrow (Purple) */}
+                <marker id="arrow-highlight-merge" viewBox="0 0 10 10" refX="26" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 1 L 9 5 L 0 9 z" fill="#d8b4fe" />
                 </marker>
               </defs>
 
@@ -751,15 +779,43 @@ export default function VersionDagPanel() {
 
                   const edgeKey = `${edge.childVersionId}->${edge.parentVersionId}`;
                   const isHighlighted = connectedEdgeSet.has(edgeKey);
-                  const hasActiveHover = Boolean(hoveredNodeId || selectedNode);
                   const isMergeEdge = source.isMerge;
+                  const isMain = source.branchId === 'main';
 
-                  const strokeColor = isHighlighted
-                    ? isMergeEdge ? '#d8b4fe' : '#34d399'
-                    : isMergeEdge ? '#a855f7' : 'rgba(255,255,255,0.2)';
+                  let strokeColor = '#475569'; // Clearly visible slate edge by default
+                  let markerId = 'url(#arrow-default)';
+                  let strokeWidth = 2;
+                  let opacity = 0.65;
 
-                  const strokeWidth = isHighlighted ? (isMergeEdge ? 3 : 2.5) : (isMergeEdge ? 2 : 1.5);
-                  const opacity = hasActiveHover && !isHighlighted ? 0.22 : 1;
+                  if (isMergeEdge) {
+                    strokeColor = '#a855f7';
+                    markerId = 'url(#arrow-merge-default)';
+                    strokeWidth = 2;
+                    opacity = 0.75;
+                  } else if (!isMain) {
+                    strokeColor = '#6366f1';
+                    markerId = 'url(#arrow-default)';
+                    strokeWidth = 2;
+                    opacity = 0.7;
+                  }
+
+                  if (isHighlighted) {
+                    opacity = 1.0;
+                    strokeWidth = isMergeEdge ? 3.5 : 3.0;
+                    if (isMergeEdge) {
+                      strokeColor = '#d8b4fe';
+                      markerId = 'url(#arrow-highlight-merge)';
+                    } else if (isMain) {
+                      strokeColor = '#34d399';
+                      markerId = 'url(#arrow-highlight-main)';
+                    } else {
+                      strokeColor = '#38bdf8';
+                      markerId = 'url(#arrow-highlight-branch)';
+                    }
+                  } else if (hoveredNodeId || selectedNode) {
+                    // Non-highlighted edges stay clearly visible at 0.38 opacity
+                    opacity = 0.38;
+                  }
 
                   return (
                     <path
@@ -769,7 +825,7 @@ export default function VersionDagPanel() {
                       stroke={strokeColor}
                       strokeWidth={strokeWidth}
                       strokeDasharray={isMergeEdge ? '5 3' : undefined}
-                      markerEnd={isMergeEdge ? 'url(#arrow-merge)' : 'url(#arrow)'}
+                      markerEnd={markerId}
                       opacity={opacity}
                       className="transition-all duration-200"
                     />
@@ -787,7 +843,10 @@ export default function VersionDagPanel() {
                     <g
                       key={node.versionId}
                       transform={`translate(${node.x}, ${node.y})`}
-                      onClick={() => setSelectedNode(node)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedNode(node);
+                      }}
                       onMouseEnter={() => setHoveredNodeId(node.versionId)}
                       onMouseLeave={() => setHoveredNodeId(null)}
                       className="cursor-pointer group"
