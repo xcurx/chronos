@@ -1,4 +1,4 @@
-import { useState, useCallback, Fragment } from 'react';
+import { useState, useEffect, useCallback, Fragment } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useClusterStore } from '../stores/clusterStore';
 import type { KvPair, MvccVersion, TxnOperation } from '../types/events';
@@ -29,6 +29,31 @@ export default function KvExplorer() {
   const [validFrom, setValidFrom] = useState('');
   const [validTo, setValidTo] = useState('');
   const [showTemporalFields, setShowTemporalFields] = useState(false);
+  const [branches, setBranches] = useState<{ branchId: string; status: string; headVersionId?: string }[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState('main');
+
+  const fetchBranches = useCallback(async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/chronos/branches`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.branches) {
+          setBranches(data.branches.filter((b: any) => b.status === 'ACTIVE'));
+        }
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    fetchBranches();
+  }, [fetchBranches]);
+
+  const handleBranchChange = (newBranch: string) => {
+    setSelectedBranch(newBranch);
+    if (activeTab === 'browse') {
+      handleScan(newBranch);
+    }
+  };
 
   const apiCall = useCallback(async (url: string, body: object) => {
     setLoading(true);
@@ -51,12 +76,12 @@ export default function KvExplorer() {
 
   const handlePut = async () => {
     if (!key || !value) return;
-    const body: any = { key, value };
+    const body: any = { key, value, branchId: selectedBranch };
     if (validFrom) body.validFrom = validFrom;
     if (validTo) body.validTo = validTo;
     const data = await apiCall(`${getApiBase()}/kv/put`, body);
     if (data) {
-      setOutput(`PUT ${key} = "${value}" ${validFrom ? `(Tv: ${validFrom})` : ''} → ${data.success ? 'OK' : 'FAIL'}`);
+      setOutput(`PUT [${selectedBranch}] ${key} = "${value}" ${validFrom ? `(Tv: ${validFrom})` : ''} → ${data.success ? 'OK' : 'FAIL'}`);
       setOutputType(data.success ? 'success' : 'error');
       if (activeTab === 'browse') handleScan();
     }
@@ -64,14 +89,14 @@ export default function KvExplorer() {
 
   const handleGet = async () => {
     if (!key) return;
-    const data = await apiCall(`${getApiBase()}/kv/get`, { key });
+    const data = await apiCall(`${getApiBase()}/kv/get`, { key, branchId: selectedBranch });
     if (data) {
       if (data.found) {
         setValue(data.value || '');
-        setOutput(`GET ${key} → "${data.value}"`);
+        setOutput(`GET [${selectedBranch}] ${key} → "${data.value}"`);
         setOutputType('success');
       } else {
-        setOutput(`GET ${key} → NOT FOUND`);
+        setOutput(`GET [${selectedBranch}] ${key} → NOT FOUND`);
         setOutputType('error');
       }
     }
@@ -79,20 +104,20 @@ export default function KvExplorer() {
 
   const handleDelete = async () => {
     if (!key) return;
-    const data = await apiCall(`${getApiBase()}/kv/delete`, { key });
+    const data = await apiCall(`${getApiBase()}/kv/delete`, { key, branchId: selectedBranch });
     if (data) {
-      setOutput(`DELETE ${key} → ${data.success ? 'OK' : 'FAIL'}`);
+      setOutput(`DELETE [${selectedBranch}] ${key} → ${data.success ? 'OK' : 'FAIL'}`);
       setOutputType(data.success ? 'success' : 'error');
       setValue('');
       if (activeTab === 'browse') handleScan();
     }
   };
 
-  const handleScan = async () => {
-    const data = await apiCall(`${getApiBase()}/kv/scan`, { prefix: scanPrefix || '', limit: 100 });
+  const handleScan = async (branch = selectedBranch) => {
+    const data = await apiCall(`${getApiBase()}/kv/scan`, { prefix: scanPrefix || '', limit: 100, branchId: branch });
     if (data && data.pairs) {
       setResults(data.pairs);
-      setOutput(`SCAN "${scanPrefix || '*'}" → ${data.pairs.length} results`);
+      setOutput(`SCAN [${branch}] "${scanPrefix || '*'}" → ${data.pairs.length} results`);
       setOutputType('info');
     }
   };
@@ -126,8 +151,8 @@ export default function KvExplorer() {
   const removeTxnOp = (i: number) => setTxnOps(txnOps.filter((_, idx) => idx !== i));
   const executeTxn = async () => {
     if (txnOps.length === 0) return;
-    const data = await apiCall(`${getApiBase()}/kv/txn`, { operations: txnOps });
-    if (data) setTxnResult(`TXN ${data.txnId}: ${data.status} (${data.message || 'done'})`);
+    const data = await apiCall(`${getApiBase()}/kv/txn`, { operations: txnOps, branchId: selectedBranch });
+    if (data) setTxnResult(`TXN [${selectedBranch}] ${data.txnId}: ${data.status} (${data.message || 'done'})`);
   };
 
   const tabs = [
@@ -144,24 +169,52 @@ export default function KvExplorer() {
           <h2 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-white/70 bg-clip-text text-transparent">KV Store</h2>
           <p className="text-xs text-white/30 mt-0.5">Query, browse, and manage your distributed key-value data</p>
         </div>
-        <div className="ml-auto flex items-center gap-1 bg-white/[0.025] rounded-2xl p-1 border border-white/[0.05]">
-          {tabs.map((tab) => {
-            const Icon = tab.icon;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-all duration-200 ${
-                  activeTab === tab.id
-                    ? 'bg-white/[0.1] text-white ring-1 ring-white/[0.08]'
-                    : 'text-white/35 hover:text-white/60 hover:bg-white/[0.03]'
-                }`}
-              >
-                <Icon className={`w-3.5 h-3.5 ${activeTab === tab.id ? 'text-emerald-400' : ''}`} />
-                <span>{tab.label}</span>
-              </button>
-            );
-          })}
+
+        <div className="ml-auto flex items-center gap-3">
+          {/* Branch Selector Dropdown */}
+          <div className="flex items-center gap-2 bg-surface-900/80 border border-white/[0.08] rounded-xl px-3 py-1.5 text-xs backdrop-blur-md">
+            <GitBranch className="w-3.5 h-3.5 text-purple-400" />
+            <span className="text-white/40 font-medium">Branch:</span>
+            <select
+              value={selectedBranch}
+              onChange={(e) => handleBranchChange(e.target.value)}
+              className="bg-transparent text-purple-300 font-mono font-bold focus:outline-none cursor-pointer"
+            >
+              {branches.map((b) => (
+                <option key={b.branchId} value={b.branchId} className="bg-surface-950 text-white font-mono">
+                  {b.branchId} {b.branchId === 'main' ? '(main)' : ''}
+                </option>
+              ))}
+              {!branches.some((b) => b.branchId === 'main') && (
+                <option value="main" className="bg-surface-950 text-white font-mono">main (main)</option>
+              )}
+            </select>
+            {selectedBranch !== 'main' && (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                Isolated
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1 bg-white/[0.025] rounded-2xl p-1 border border-white/[0.05]">
+            {tabs.map((tab) => {
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-all duration-200 ${
+                    activeTab === tab.id
+                      ? 'bg-white/[0.1] text-white ring-1 ring-white/[0.08]'
+                      : 'text-white/35 hover:text-white/60 hover:bg-white/[0.03]'
+                  }`}
+                >
+                  <Icon className={`w-3.5 h-3.5 ${activeTab === tab.id ? 'text-emerald-400' : ''}`} />
+                  <span>{tab.label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -253,7 +306,7 @@ export default function KvExplorer() {
                   className="glass-input w-full font-mono text-xs"
                 />
               </div>
-              <button onClick={handleScan} disabled={loading}
+              <button onClick={() => handleScan()} disabled={loading}
                 className="w-full glass-button-primary flex items-center justify-center gap-2 text-xs">
                 <Search className="w-3.5 h-3.5" /> Scan Database
               </button>
@@ -329,8 +382,11 @@ export default function KvExplorer() {
               <div className="p-1.5 rounded-lg bg-white/[0.04]">
                 <Table2 className="w-4 h-4 text-white/40" />
               </div>
-              <h3 className="text-sm font-semibold text-white/60">
-                {activeTab === 'browse' ? `Results` : 'Data Table'}
+              <h3 className="text-sm font-semibold text-white/60 flex items-center gap-2">
+                <span>{activeTab === 'browse' ? 'Browse Keys' : 'Data Table'}</span>
+                <span className="font-mono text-purple-300 text-xs px-2 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/20">
+                  branch: {selectedBranch}
+                </span>
               </h3>
               {results.length > 0 && (
                 <span className="text-[10px] font-mono text-brand-400 bg-brand-500/10 px-2 py-0.5 rounded-md border border-brand-500/15">
@@ -339,7 +395,7 @@ export default function KvExplorer() {
               )}
             </div>
             {activeTab !== 'browse' && (
-              <button onClick={handleScan} className="text-[11px] text-brand-400 hover:text-brand-300 flex items-center gap-1.5 transition-colors px-2.5 py-1 rounded-lg hover:bg-brand-500/[0.06]">
+              <button onClick={() => handleScan()} className="text-[11px] text-brand-400 hover:text-brand-300 flex items-center gap-1.5 transition-colors px-2.5 py-1 rounded-lg hover:bg-brand-500/[0.06]">
                 <Search className="w-3 h-3" /> Load All
               </button>
             )}

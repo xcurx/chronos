@@ -1,6 +1,10 @@
 package com.minidb.api;
 
 import com.chronos.model.ChronosWritePayload;
+import com.chronos.query.DatabaseStateResult;
+import com.chronos.query.QueryMode;
+import com.chronos.query.TemporalQueryRequest;
+import com.chronos.query.TemporalQueryResult;
 import com.chronos.query.TemporalQueryService;
 import com.minidb.config.RaftConfig;
 import com.minidb.events.ClusterEvent;
@@ -13,6 +17,7 @@ import com.minidb.speculation.SpeculativeManager;
 import com.minidb.txn.TxnCoordinator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.net.URI;
@@ -39,6 +44,9 @@ public class KvController {
     private final SpeculativeManager speculativeManager;
     private final EventBus eventBus;
     private final HttpClient httpClient;
+
+    @Autowired(required = false)
+    private TemporalQueryService temporalQueryService;
 
     public KvController(RaftNode raftNode, RaftConfig raftConfig,
                         TxnCoordinator txnCoordinator, SpeculativeManager speculativeManager,
@@ -135,6 +143,8 @@ public class KvController {
         long start = System.currentTimeMillis();
         String key = request.get("key");
         String value = request.get("value");
+        String branchId = request.getOrDefault("branchId", "main");
+        if (branchId == null || branchId.isBlank()) branchId = "main";
         String validFromStr = request.get("validFrom");
         String validToStr = request.get("validTo");
         Long validFrom = null;
@@ -149,16 +159,19 @@ public class KvController {
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             RaftNode.ChronosWriteResult writeResult;
-            if (validFrom != null || validTo != null) {
+            if (!"main".equals(branchId) || validFrom != null || validTo != null) {
                 ChronosWritePayload payload = ChronosWritePayload.builder()
-                        .branchId("main")
+                        .branchId(branchId)
                         .writerId("kv-user")
                         .operations(List.of(ChronosWritePayload.WriteOp.put(
                                 key, value.getBytes(StandardCharsets.UTF_8), validFrom, validTo)))
                         .validFrom(validFrom)
                         .validTo(validTo)
                         .build();
-                writeResult = raftNode.submitChronosWrite(RaftLog.CommandType.CHRONOS_WRITE, payload)
+                RaftLog.CommandType cmdType = !"main".equals(branchId)
+                        ? RaftLog.CommandType.CHRONOS_BRANCH_WRITE
+                        : RaftLog.CommandType.CHRONOS_WRITE;
+                writeResult = raftNode.submitChronosWrite(cmdType, payload)
                         .get(5, java.util.concurrent.TimeUnit.SECONDS);
             } else {
                 writeResult = raftNode.submitPutWithResult(
@@ -364,6 +377,8 @@ public class KvController {
     public Map<String, Object> get(@RequestBody Map<String, Object> request) {
         long start = System.currentTimeMillis();
         String key = (String) request.get("key");
+        String branchId = request.containsKey("branchId") ? String.valueOf(request.get("branchId")) : "main";
+        if (branchId == null || branchId.isBlank()) branchId = "main";
         Long timestamp = request.containsKey("timestamp") ?
                 ((Number) request.get("timestamp")).longValue() : 0L;
         // Support speculative reads via "readMode" parameter
@@ -373,6 +388,23 @@ public class KvController {
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
+            if (!"main".equals(branchId) && temporalQueryService != null) {
+                TemporalQueryResult r = temporalQueryService.queryKey(
+                        TemporalQueryRequest.current(key, branchId, readMode, false));
+                long latency = System.currentTimeMillis() - start;
+                result.put("found", r.found());
+                if (r.found()) {
+                    result.put("value", r.value());
+                    result.put("timestamp", r.timestamp());
+                    result.put("versionId", r.versionId());
+                    result.put("branchId", branchId);
+                }
+                result.put("readMode", readMode.name());
+                result.put("latencyMs", latency);
+                eventBus.publish(ClusterEvent.kvOperation("GET", key, latency, r.found()));
+                return result;
+            }
+
             MvccStore.MvccResult mvccResult;
             if (timestamp > 0) {
                 mvccResult = raftNode.getMvccStore().get(key, timestamp);
@@ -416,11 +448,25 @@ public class KvController {
 
         long start = System.currentTimeMillis();
         String key = request.get("key");
+        String branchId = request.getOrDefault("branchId", "main");
+        if (branchId == null || branchId.isBlank()) branchId = "main";
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            RaftNode.ChronosWriteResult writeResult = raftNode.submitDeleteWithResult(key)
-                    .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            RaftNode.ChronosWriteResult writeResult;
+            if (!"main".equals(branchId)) {
+                ChronosWritePayload payload = ChronosWritePayload.builder()
+                        .branchId(branchId)
+                        .writerId("kv-user")
+                        .operations(List.of(ChronosWritePayload.WriteOp.delete(key)))
+                        .build();
+                writeResult = raftNode.submitChronosWrite(
+                        RaftLog.CommandType.CHRONOS_BRANCH_WRITE, payload)
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            } else {
+                writeResult = raftNode.submitDeleteWithResult(key)
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
 
             boolean committed = writeResult != null && writeResult.committed();
             long latency = System.currentTimeMillis() - start;
@@ -451,6 +497,8 @@ public class KvController {
         String startKey = (String) request.getOrDefault("prefix",
                 request.getOrDefault("startKey", ""));
         String endKey = (String) request.getOrDefault("endKey", null);
+        String branchId = request.containsKey("branchId") ? String.valueOf(request.get("branchId")) : "main";
+        if (branchId == null || branchId.isBlank()) branchId = "main";
         int limit = request.containsKey("limit") ?
                 ((Number) request.get("limit")).intValue() : 100;
         long timestamp = request.containsKey("timestamp") ?
@@ -461,6 +509,27 @@ public class KvController {
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
+            if (!"main".equals(branchId) && temporalQueryService != null) {
+                DatabaseStateResult state = temporalQueryService.reconstructState(
+                        new TemporalQueryRequest(QueryMode.CURRENT, null, null, null, null, branchId, readMode, false, startKey, limit, null, null, null));
+                List<Map<String, Object>> pairs = new ArrayList<>();
+                for (Map.Entry<String, String> e : state.entries().entrySet()) {
+                    if (startKey.isEmpty() || e.getKey().startsWith(startKey)) {
+                        Map<String, Object> pair = new LinkedHashMap<>();
+                        pair.put("key", e.getKey());
+                        pair.put("value", e.getValue());
+                        pairs.add(pair);
+                    }
+                }
+                long latency = System.currentTimeMillis() - start;
+                result.put("pairs", pairs);
+                result.put("count", pairs.size());
+                result.put("branchId", branchId);
+                result.put("latencyMs", latency);
+                eventBus.publish(ClusterEvent.kvOperation("SCAN", startKey, latency, true));
+                return result;
+            }
+
             List<MvccStore.MvccResult> results = raftNode.getMvccStore()
                     .scan(startKey, endKey, limit, timestamp, readMode);
 
