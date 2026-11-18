@@ -75,6 +75,7 @@ export default function TimeTravelPanel() {
   const [bitemporalTimelineData, setBitemporalTimelineData] = useState<BitemporalTimelineResponse | null>(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [auditViewMode, setAuditViewMode] = useState<'trail' | 'timeline'>('trail');
+  const [timelineSort, setTimelineSort] = useState<'TT' | 'TV'>('TT');
 
   // UI state
   const [loading, setLoading] = useState(false);
@@ -372,7 +373,10 @@ export default function TimeTravelPanel() {
   const computedTimeline = useMemo(() => {
     if (!bitemporalTimelineData?.timeline) return [];
     const list = bitemporalTimelineData.timeline.map((item) => ({ ...item }));
+    // 1. Sort strictly in consensus commit sequence (Tt)
     list.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0) || (a.txnTime ?? 0) - (b.txnTime ?? 0));
+
+    // 2. Compute closed superseded intervals
     for (let i = 0; i < list.length - 1; i++) {
       const curr = list[i];
       const next = list[i + 1];
@@ -386,8 +390,29 @@ export default function TimeTravelPanel() {
         }
       }
     }
-    return list;
-  }, [bitemporalTimelineData]);
+
+    // 3. Detect retroactive adjustment mutations (where validFrom targets a date earlier than previously recorded commits)
+    let maxValidFromSeen = -1;
+    const enriched = list.map((item) => {
+      const vFrom = item.validFrom ?? item.txnTime ?? 0;
+      const isRetroactive = maxValidFromSeen > 0 && vFrom < maxValidFromSeen;
+      if (vFrom > maxValidFromSeen) {
+        maxValidFromSeen = vFrom;
+      }
+      return { ...item, isRetroactive };
+    });
+
+    // 4. Re-sort if TV mode selected
+    if (timelineSort === 'TV') {
+      enriched.sort((a, b) => {
+        const aFrom = a.validFrom ?? a.txnTime ?? 0;
+        const bFrom = b.validFrom ?? b.txnTime ?? 0;
+        return aFrom - bFrom || (a.sequence ?? 0) - (b.sequence ?? 0);
+      });
+    }
+
+    return enriched;
+  }, [bitemporalTimelineData, timelineSort]);
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-surface-950 p-6 space-y-5">
@@ -821,11 +846,24 @@ export default function TimeTravelPanel() {
                             <td className="py-2.5 px-4 font-mono text-white/90 max-w-xs truncate">{v}</td>
                             <td className="py-2.5 px-4 font-mono text-[11px]">
                               {hasInterval ? (
-                                <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-                                  {formatValidInterval(detail.validFrom, detail.validTo)}
-                                </span>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
+                                    {formatValidInterval(detail.validFrom, detail.validTo)}
+                                  </span>
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                                    Bitemporal
+                                  </span>
+                                </div>
                               ) : (
-                                <span className="text-white/40">[Epoch → ∞)</span>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="text-white/40 font-mono">[Epoch → ∞)</span>
+                                  <span
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-white/[0.04] text-white/40 border border-white/[0.08]"
+                                    title="Standard non-temporal key: valid across all business time"
+                                  >
+                                    Standard KV (Unbounded)
+                                  </span>
+                                </div>
                               )}
                             </td>
                             <td className="py-2.5 px-4 font-mono text-[11px] text-white/60">
@@ -974,13 +1012,54 @@ export default function TimeTravelPanel() {
             {/* VIEW 2: 2D Bitemporal Intervals View */}
             {auditViewMode === 'timeline' && bitemporalTimelineData && (
               <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl space-y-4">
-                <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] pb-3">
                   <div>
                     <h3 className="text-sm font-bold text-white font-mono">{bitemporalTimelineData.key}</h3>
                     <p className="text-xs text-white/50">
                       2D Bitemporal Interval Mapping ({computedTimeline.length} recorded versions)
                     </p>
                   </div>
+
+                  {/* Ordering Toggle */}
+                  <div className="flex items-center gap-1.5 bg-surface-950 p-1 rounded-xl border border-white/[0.08] text-xs">
+                    <span className="text-white/40 text-[11px] px-2">Order by:</span>
+                    <button
+                      onClick={() => setTimelineSort('TT')}
+                      className={`px-3 py-1 rounded-lg font-medium transition text-[11px] ${
+                        timelineSort === 'TT'
+                          ? 'bg-purple-600 text-white shadow-sm'
+                          : 'text-white/50 hover:text-white'
+                      }`}
+                      title="Sort by Raft consensus commit sequence (physical ledger order)"
+                    >
+                      Commit Order (Tt)
+                    </button>
+                    <button
+                      onClick={() => setTimelineSort('TV')}
+                      className={`px-3 py-1 rounded-lg font-medium transition text-[11px] ${
+                        timelineSort === 'TV'
+                          ? 'bg-emerald-600 text-white shadow-sm'
+                          : 'text-white/50 hover:text-white'
+                      }`}
+                      title="Sort by Real-World Calendar Validity (business effective dates)"
+                    >
+                      Calendar Order (Tv)
+                    </button>
+                  </div>
+                </div>
+
+                {/* Explanatory callout based on active sort */}
+                <div className="bg-surface-950/70 border border-white/[0.06] rounded-xl px-3.5 py-2.5 text-[11px] text-white/60 flex items-center gap-2">
+                  <Info className="w-4 h-4 text-indigo-400 shrink-0" />
+                  {timelineSort === 'TT' ? (
+                    <span>
+                      <strong className="text-purple-300 font-semibold">Consensus Commit Order (Tt):</strong> Showing physical append order in the Raft consensus log. Retroactive adjustments appear at their commit timestamp, preserving an immutable audit trail.
+                    </span>
+                  ) : (
+                    <span>
+                      <strong className="text-emerald-300 font-semibold">Calendar Validity Order (Tv):</strong> Showing real-world chronological timeline. Versions are sorted by the business dates when facts were effective in reality.
+                    </span>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 gap-3">
@@ -996,6 +1075,12 @@ export default function TimeTravelPanel() {
                           <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
                             {item.opType}
                           </span>
+                          {item.isRetroactive && (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
+                              <Sparkles className="w-3 h-3 text-amber-400" />
+                              <span>Retroactive Adjustment</span>
+                            </span>
+                          )}
                         </div>
                         <div className="text-[11px] text-white/40">
                           Recorded at Tt: <span className="text-white/70 font-mono">{new Date(item.txnTime).toLocaleString()}</span>
@@ -1239,7 +1324,7 @@ export default function TimeTravelPanel() {
               exit={{ scale: 0.95, opacity: 0 }}
               className="bg-surface-900 border border-white/[0.1] rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-2xl max-h-[85vh] flex flex-col"
             >
-              <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] pb-3">
                 <div className="flex items-center gap-2">
                   <Calendar className="w-5 h-5 text-emerald-400" />
                   <div>
@@ -1247,15 +1332,58 @@ export default function TimeTravelPanel() {
                     <span className="text-xs text-white/50">2D Bitemporal Timeline & Valid Windows</span>
                   </div>
                 </div>
-                <button
-                  onClick={() => {
-                    setBitemporalTimelineKey(null);
-                    setBitemporalTimelineData(null);
-                  }}
-                  className="p-1 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.05]"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+
+                <div className="flex items-center gap-2">
+                  {/* Ordering Toggle */}
+                  <div className="flex items-center gap-1 bg-surface-950 p-1 rounded-xl border border-white/[0.08] text-xs">
+                    <button
+                      onClick={() => setTimelineSort('TT')}
+                      className={`px-2.5 py-1 rounded-lg font-medium transition text-[11px] ${
+                        timelineSort === 'TT'
+                          ? 'bg-purple-600 text-white shadow-sm'
+                          : 'text-white/50 hover:text-white'
+                      }`}
+                      title="Sort by Raft consensus commit sequence (physical ledger order)"
+                    >
+                      Commit Order (Tt)
+                    </button>
+                    <button
+                      onClick={() => setTimelineSort('TV')}
+                      className={`px-2.5 py-1 rounded-lg font-medium transition text-[11px] ${
+                        timelineSort === 'TV'
+                          ? 'bg-emerald-600 text-white shadow-sm'
+                          : 'text-white/50 hover:text-white'
+                      }`}
+                      title="Sort by Real-World Calendar Validity (business effective dates)"
+                    >
+                      Calendar Order (Tv)
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      setBitemporalTimelineKey(null);
+                      setBitemporalTimelineData(null);
+                    }}
+                    className="p-1 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.05]"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Explanatory callout */}
+              <div className="bg-surface-950/70 border border-white/[0.06] rounded-xl px-3 py-2 text-[11px] text-white/60 flex items-center gap-2">
+                <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                {timelineSort === 'TT' ? (
+                  <span>
+                    <strong className="text-purple-300 font-semibold">Consensus Commit Order (Tt):</strong> Ledger append order. Retroactive audit adjustments are stored at commit time to guarantee immutability.
+                  </span>
+                ) : (
+                  <span>
+                    <strong className="text-emerald-300 font-semibold">Calendar Validity Order (Tv):</strong> Effective chronological business timeline sorted by real-world dates.
+                  </span>
+                )}
               </div>
 
               <div className="flex-1 overflow-y-auto space-y-3">
@@ -1276,6 +1404,12 @@ export default function TimeTravelPanel() {
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
                             {point.opType}
                           </span>
+                          {point.isRetroactive && (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
+                              <Sparkles className="w-3 h-3 text-amber-400" />
+                              <span>Retroactive Adjustment</span>
+                            </span>
+                          )}
                           <span className="text-white/40 font-mono text-[11px]">{point.writerId}</span>
                         </div>
                         <span className="text-[10px] text-white/40 font-mono">

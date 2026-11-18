@@ -1,10 +1,13 @@
 package com.minidb.api;
 
+import com.chronos.model.ChronosWritePayload;
+import com.chronos.query.TemporalQueryService;
 import com.minidb.config.RaftConfig;
 import com.minidb.events.ClusterEvent;
 import com.minidb.events.EventBus;
 import com.minidb.mvcc.MvccStore;
 import com.minidb.mvcc.ReadMode;
+import com.minidb.raft.RaftLog;
 import com.minidb.raft.RaftNode;
 import com.minidb.speculation.SpeculativeManager;
 import com.minidb.txn.TxnCoordinator;
@@ -132,12 +135,36 @@ public class KvController {
         long start = System.currentTimeMillis();
         String key = request.get("key");
         String value = request.get("value");
+        String validFromStr = request.get("validFrom");
+        String validToStr = request.get("validTo");
+        Long validFrom = null;
+        Long validTo = null;
+        if (validFromStr != null && !validFromStr.isBlank()) {
+            try { validFrom = TemporalQueryService.parseTimestamp(validFromStr); } catch (Exception ignored) {}
+        }
+        if (validToStr != null && !validToStr.isBlank()) {
+            try { validTo = TemporalQueryService.parseTimestamp(validToStr); } catch (Exception ignored) {}
+        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            RaftNode.ChronosWriteResult writeResult = raftNode.submitPutWithResult(
-                            key, value.getBytes(StandardCharsets.UTF_8))
-                    .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            RaftNode.ChronosWriteResult writeResult;
+            if (validFrom != null || validTo != null) {
+                ChronosWritePayload payload = ChronosWritePayload.builder()
+                        .branchId("main")
+                        .writerId("kv-user")
+                        .operations(List.of(ChronosWritePayload.WriteOp.put(
+                                key, value.getBytes(StandardCharsets.UTF_8), validFrom, validTo)))
+                        .validFrom(validFrom)
+                        .validTo(validTo)
+                        .build();
+                writeResult = raftNode.submitChronosWrite(RaftLog.CommandType.CHRONOS_WRITE, payload)
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            } else {
+                writeResult = raftNode.submitPutWithResult(
+                                key, value.getBytes(StandardCharsets.UTF_8))
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
 
             boolean committed = writeResult != null && writeResult.committed();
             long latency = System.currentTimeMillis() - start;

@@ -26,6 +26,9 @@ export default function KvExplorer() {
   const [loading, setLoading] = useState(false);
   const [txnOps, setTxnOps] = useState<TxnOperation[]>([]);
   const [txnResult, setTxnResult] = useState('');
+  const [validFrom, setValidFrom] = useState('');
+  const [validTo, setValidTo] = useState('');
+  const [showTemporalFields, setShowTemporalFields] = useState(false);
 
   const apiCall = useCallback(async (url: string, body: object) => {
     setLoading(true);
@@ -48,9 +51,12 @@ export default function KvExplorer() {
 
   const handlePut = async () => {
     if (!key || !value) return;
-    const data = await apiCall(`${getApiBase()}/kv/put`, { key, value });
+    const body: any = { key, value };
+    if (validFrom) body.validFrom = validFrom;
+    if (validTo) body.validTo = validTo;
+    const data = await apiCall(`${getApiBase()}/kv/put`, body);
     if (data) {
-      setOutput(`PUT ${key} = "${value}" → ${data.success ? 'OK' : 'FAIL'}`);
+      setOutput(`PUT ${key} = "${value}" ${validFrom ? `(Tv: ${validFrom})` : ''} → ${data.success ? 'OK' : 'FAIL'}`);
       setOutputType(data.success ? 'success' : 'error');
       if (activeTab === 'browse') handleScan();
     }
@@ -181,6 +187,43 @@ export default function KvExplorer() {
                   rows={3}
                   className="glass-input w-full font-mono text-xs resize-none"
                 />
+              </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowTemporalFields(!showTemporalFields)}
+                  className="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 transition"
+                >
+                  <Clock className="w-3 h-3" />
+                  <span>{showTemporalFields ? 'Hide Temporal Validity (Tv)' : '+ Bitemporal Validity Window (Tv)'}</span>
+                </button>
+
+                {showTemporalFields && (
+                  <div className="mt-2 p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-2">
+                    <div>
+                      <label className="block text-[10px] text-white/40 mb-1">Valid-Time From (Tv)</label>
+                      <input
+                        type="datetime-local"
+                        value={validFrom}
+                        onChange={(e) => setValidFrom(e.target.value)}
+                        className="glass-input w-full text-[11px] font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-white/40 mb-1">Valid-Time To (Tv) (optional)</label>
+                      <input
+                        type="datetime-local"
+                        value={validTo}
+                        onChange={(e) => setValidTo(e.target.value)}
+                        placeholder="Leave blank for ∞"
+                        className="glass-input w-full text-[11px] font-mono"
+                      />
+                    </div>
+                    <p className="text-[10px] text-white/30 italic">
+                      Leave empty for standard unbounded non-temporal key [Epoch → ∞).
+                    </p>
+                  </div>
+                )}
               </div>
               <div className="flex gap-2">
                 <button onClick={handlePut} disabled={loading}

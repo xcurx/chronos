@@ -46,6 +46,8 @@ export default function VersionDagPanel() {
   const [writeKey, setWriteKey] = useState('');
   const [writeValue, setWriteValue] = useState('');
   const [writeWriterId, setWriteWriterId] = useState('ui-user');
+  const [writeValidFrom, setWriteValidFrom] = useState('');
+  const [writeValidTo, setWriteValidTo] = useState('');
   const [writing, setWriting] = useState(false);
 
   // Merge Studio
@@ -149,14 +151,31 @@ export default function VersionDagPanel() {
     setWriting(true);
     setErrorMsg(null);
     try {
+      const parsedValidFrom = writeValidFrom ? new Date(writeValidFrom).toISOString() : undefined;
+      const parsedValidTo = writeValidTo ? new Date(writeValidTo).toISOString() : undefined;
+
       const res = await fetch(`${getApiBase()}/chronos/write`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           branchId: writeBranchId,
           writerId: writeWriterId || 'ui-user',
-          operations: [{ opType: 'PUT', key: writeKey.trim(), value: writeValue }],
-          ops: [{ opType: 'PUT', key: writeKey.trim(), value: writeValue }],
+          validFrom: parsedValidFrom,
+          validTo: parsedValidTo,
+          operations: [{
+            opType: 'PUT',
+            key: writeKey.trim(),
+            value: writeValue,
+            validFrom: parsedValidFrom,
+            validTo: parsedValidTo,
+          }],
+          ops: [{
+            opType: 'PUT',
+            key: writeKey.trim(),
+            value: writeValue,
+            validFrom: parsedValidFrom,
+            validTo: parsedValidTo,
+          }],
         }),
       });
       const data = await res.json();
@@ -164,6 +183,8 @@ export default function VersionDagPanel() {
         setShowWriteModal(false);
         setWriteKey('');
         setWriteValue('');
+        setWriteValidFrom('');
+        setWriteValidTo('');
         await fetchDagAndBranches();
       } else {
         setErrorMsg(data.error || data.message || 'Write failed');
@@ -1173,6 +1194,40 @@ export default function VersionDagPanel() {
                     onChange={(e) => setWriteWriterId(e.target.value)}
                     className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-purple-500"
                   />
+                </div>
+
+                <div className="pt-2 border-t border-white/[0.06] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-white/70 font-semibold text-[11px] flex items-center gap-1.5 text-emerald-400">
+                      <span>Bitemporal Validity (Tv)</span>
+                      <span className="text-[10px] text-white/40 font-normal">(optional)</span>
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-[10px] text-white/50 block mb-1">Valid-Time From (Tv)</label>
+                      <input
+                        type="datetime-local"
+                        value={writeValidFrom}
+                        onChange={(e) => setWriteValidFrom(e.target.value)}
+                        className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-2.5 py-1.5 text-[11px] text-white font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-white/50 block mb-1">Valid-Time To (Tv)</label>
+                      <input
+                        type="datetime-local"
+                        value={writeValidTo}
+                        onChange={(e) => setWriteValidTo(e.target.value)}
+                        placeholder="Leave blank for ∞"
+                        className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-2.5 py-1.5 text-[11px] text-white font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-white/30 italic">
+                    Leave blank to commit standard non-temporal unbounded entry [Epoch → ∞).
+                  </p>
                 </div>
               </div>
 
