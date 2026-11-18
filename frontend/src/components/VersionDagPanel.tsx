@@ -40,6 +40,14 @@ export default function VersionDagPanel() {
   const [newBranchBase, setNewBranchBase] = useState('');
   const [newBranchWriter, setNewBranchWriter] = useState('');
 
+  // Branch Write Modal
+  const [showWriteModal, setShowWriteModal] = useState(false);
+  const [writeBranchId, setWriteBranchId] = useState('');
+  const [writeKey, setWriteKey] = useState('');
+  const [writeValue, setWriteValue] = useState('');
+  const [writeWriterId, setWriteWriterId] = useState('ui-user');
+  const [writing, setWriting] = useState(false);
+
   // Merge Studio
   const [showMergeDrawer, setShowMergeDrawer] = useState(false);
   const [mergeSource, setMergeSource] = useState('');
@@ -94,26 +102,76 @@ export default function VersionDagPanel() {
     fetchDagAndBranches();
   }, [fetchDagAndBranches]);
 
+  // Map which branch heads point to which version
+  const branchHeadsByNode = useMemo(() => {
+    const map = new Map<string, string[]>();
+    branches.forEach((b) => {
+      if (b.status === 'ACTIVE' && b.headVersionId) {
+        const list = map.get(b.headVersionId) || [];
+        list.push(b.branchId);
+        map.set(b.headVersionId, list);
+      }
+    });
+    return map;
+  }, [branches]);
+
   // Create New Branch
   const handleCreateBranch = async () => {
     if (!newBranchId.trim()) return;
+    const fallbackBase = dag?.nodes && dag.nodes.length > 0
+      ? dag.nodes[dag.nodes.length - 1].versionId
+      : undefined;
+    const effectiveBase = newBranchBase || fallbackBase;
     try {
       const res = await fetch(`${getApiBase()}/chronos/branches`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           branchId: newBranchId.trim(),
-          baseVersionId: newBranchBase || undefined,
+          baseVersionId: effectiveBase,
           writerId: newBranchWriter || 'ui-user',
         }),
       });
       if (res.ok) {
         setShowNewBranchModal(false);
         setNewBranchId('');
-        fetchDagAndBranches();
+        setNewBranchBase('');
+        await fetchDagAndBranches();
       }
     } catch (e: any) {
       setErrorMsg('Failed to create branch: ' + e.message);
+    }
+  };
+
+  // Commit Write directly to a Branch
+  const handleBranchWrite = async () => {
+    if (!writeBranchId || !writeKey.trim()) return;
+    setWriting(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${getApiBase()}/chronos/write`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          branchId: writeBranchId,
+          writerId: writeWriterId || 'ui-user',
+          operations: [{ opType: 'PUT', key: writeKey.trim(), value: writeValue }],
+          ops: [{ opType: 'PUT', key: writeKey.trim(), value: writeValue }],
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setShowWriteModal(false);
+        setWriteKey('');
+        setWriteValue('');
+        await fetchDagAndBranches();
+      } else {
+        setErrorMsg(data.error || data.message || 'Write failed');
+      }
+    } catch (e: any) {
+      setErrorMsg('Write failed: ' + e.message);
+    } finally {
+      setWriting(false);
     }
   };
 
@@ -613,7 +671,7 @@ export default function VersionDagPanel() {
             <div className="flex items-center gap-2 text-xs">
               <span className="font-bold text-white uppercase tracking-wider">Version DAG Graph</span>
               <span className="text-white/40">
-                ({dag?.nodeCount ?? dag?.nodes?.length ?? 0} versions, {dag?.edgeCount ?? dag?.edges?.length ?? 0} edges)
+                ({layoutNodes.length} versions, {dag?.edges?.length ?? 0} edges)
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -713,6 +771,37 @@ export default function VersionDagPanel() {
                       onMouseLeave={() => setHoveredNodeId(null)}
                       className="cursor-pointer group"
                     >
+                      {/* Branch Head Badges (Git-style branch ref tags) */}
+                      {branchHeadsByNode.get(node.versionId)?.map((branchName, bIdx) => {
+                        const isMainBranch = branchName === 'main';
+                        const textWidth = Math.min(branchName.length * 6.5 + 14, 85);
+                        return (
+                          <g key={branchName} transform={`translate(0, ${-(isMerge ? 28 : 24) - bIdx * 17 - 8})`}>
+                            <rect
+                              x={-textWidth / 2}
+                              y="-7"
+                              width={textWidth}
+                              height="14"
+                              rx="7"
+                              fill={isMainBranch ? '#065f46' : '#581c87'}
+                              stroke={isMainBranch ? '#10b981' : '#c084fc'}
+                              strokeWidth="1"
+                              opacity="0.95"
+                            />
+                            <text
+                              textAnchor="middle"
+                              y="3"
+                              fill="#ffffff"
+                              fontSize="8"
+                              fontFamily="monospace"
+                              fontWeight="bold"
+                            >
+                              {branchName.length > 10 ? branchName.substring(0, 9) + '…' : branchName}
+                            </text>
+                          </g>
+                        );
+                      })}
+
                       {/* Node Halo / Selection Ring */}
                       {(isSelected || isHovered) && (
                         <circle
@@ -912,17 +1001,41 @@ export default function VersionDagPanel() {
           {/* Branches Summary */}
           <div className="pt-4 border-t border-white/[0.06] space-y-2">
             <span className="text-[10px] uppercase font-bold tracking-wider text-white/40 block">
-              Active Branches ({branches.length})
+              Active Branches ({branches?.length || 0})
             </span>
-            <div className="space-y-1.5 max-h-40 overflow-y-auto">
+            <div className="space-y-1.5 max-h-48 overflow-y-auto">
               {branches.map((b) => (
-                <div key={b.branchId} className="flex items-center justify-between bg-surface-950 p-2 rounded-lg text-xs font-mono">
-                  <span className="text-purple-300">{b.branchId}</span>
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                    b.status === 'MERGED' ? 'bg-white/10 text-white/40' : 'bg-emerald-500/20 text-emerald-400'
-                  }`}>
-                    {b.status}
-                  </span>
+                <div key={b.branchId} className="flex flex-col gap-1 bg-surface-950 p-2.5 rounded-lg text-xs font-mono border border-white/[0.04]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-purple-300 font-medium truncate max-w-[130px]" title={b.branchId}>
+                      {b.branchId}
+                    </span>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded font-sans ${
+                        b.status === 'MERGED' ? 'bg-white/10 text-white/40' : 'bg-emerald-500/20 text-emerald-400'
+                      }`}>
+                        {b.status}
+                      </span>
+                      {b.status === 'ACTIVE' && (
+                        <button
+                          onClick={() => {
+                            setWriteBranchId(b.branchId);
+                            setWriteKey(`key-${Math.floor(Math.random() * 100)}`);
+                            setWriteValue(`val-${Date.now().toString().slice(-4)}`);
+                            setShowWriteModal(true);
+                          }}
+                          className="text-[10px] bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 px-2 py-0.5 rounded border border-purple-500/30 transition flex items-center gap-1"
+                          title={`Commit a write to ${b.branchId}`}
+                        >
+                          <Plus className="w-2.5 h-2.5" /> Write
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-white/30 flex items-center justify-between">
+                    <span>Head: <span className="text-white/50">{b.headVersionId || 'none'}</span></span>
+                    <span>{b.writerId || 'system'}</span>
+                  </div>
                 </div>
               ))}
             </div>
@@ -1008,6 +1121,82 @@ export default function VersionDagPanel() {
         )}
       </AnimatePresence>
 
+      {/* COMMIT WRITE TO BRANCH MODAL */}
+      <AnimatePresence>
+        {showWriteModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-surface-900 border border-white/[0.08] rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4"
+            >
+              <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Plus className="w-4 h-4 text-purple-400" />
+                  <span>Commit Write to Branch: <span className="font-mono text-purple-300">{writeBranchId}</span></span>
+                </h3>
+                <button onClick={() => setShowWriteModal(false)} className="text-white/40 hover:text-white">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-3 text-xs">
+                <div>
+                  <label className="text-white/60 block mb-1">Key</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. user:status"
+                    value={writeKey}
+                    onChange={(e) => setWriteKey(e.target.value)}
+                    className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-white/60 block mb-1">Value</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. active"
+                    value={writeValue}
+                    onChange={(e) => setWriteValue(e.target.value)}
+                    className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-white/60 block mb-1">Writer ID</label>
+                  <input
+                    type="text"
+                    placeholder="author-id"
+                    value={writeWriterId}
+                    onChange={(e) => setWriteWriterId(e.target.value)}
+                    className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setShowWriteModal(false)}
+                  className="px-4 py-2 rounded-xl text-xs text-white/60 hover:text-white hover:bg-white/[0.04]"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleBranchWrite}
+                  disabled={writing || !writeKey.trim()}
+                  className="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 py-2 rounded-xl text-xs transition disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {writing && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{writing ? 'Committing...' : 'Commit to Branch'}</span>
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* MERGE STUDIO DRAWER */}
       <AnimatePresence>
         {showMergeDrawer && (
@@ -1072,6 +1261,10 @@ export default function VersionDagPanel() {
                       onChange={(e) => setMergePolicy(e.target.value as any)}
                       className="w-full bg-surface-950 border border-white/[0.08] rounded-xl px-3 py-2 text-white font-mono"
                     >
+                      <option value="CRDT">CRDT (Auto: PN-Counter, OR-Set, OR-Map, LWW)</option>
+                      <option value="PN_COUNTER">CRDT: PN-Counter (Increment/Decrement Sum)</option>
+                      <option value="OR_SET">CRDT: Observed-Remove Set (Add-Wins)</option>
+                      <option value="LWW_REGISTER">CRDT: LWW-Register (Timestamp Tie-Break)</option>
                       <option value="COMMUTATIVE_DELTA">COMMUTATIVE_DELTA</option>
                       <option value="LAST_WRITE_WINS">LAST_WRITE_WINS</option>
                       <option value="FAIL_ON_CONFLICT">FAIL_ON_CONFLICT</option>
@@ -1133,7 +1326,13 @@ export default function VersionDagPanel() {
                           {mergePreview.conflicts?.map((c, i) => (
                             <div key={i} className="flex items-center justify-between bg-white/[0.02] p-2 rounded text-[11px] font-mono">
                               <span className="text-cyan-300 font-semibold">{c.key}</span>
-                              <span className="text-amber-400">{c.conflictType}</span>
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                c.conflictType === 'COMPATIBLE_CRDT' || c.conflictType === 'COMPATIBLE_DELTA' || c.conflictType === 'IDENTICAL_WRITE'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                  : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                              }`}>
+                                {c.conflictType}
+                              </span>
                               <span className="text-white/50">{c.description}</span>
                             </div>
                           ))}

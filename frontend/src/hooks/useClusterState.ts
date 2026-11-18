@@ -86,7 +86,7 @@ export function useClusterState() {
           latencyP95: overview.latencyP95 ?? 0,
           latencyP99: overview.latencyP99 ?? 0,
           elections: overview.elections ?? 0,
-          logEntries: overview.logSize ?? 0,
+          logEntries: overview.logEntries ?? overview.logSize ?? 0,
           term: overview.term ?? 0,
           commitIndex: overview.commitIndex ?? 0,
           compactionPending: overview.compactionPending ?? 0,

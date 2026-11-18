@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, Fragment } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useClusterStore } from '../stores/clusterStore';
 import type { KvPair, MvccVersion, TxnOperation } from '../types/events';
@@ -20,6 +20,7 @@ export default function KvExplorer() {
   const [results, setResults] = useState<KvPair[]>([]);
   const [versions, setVersions] = useState<MvccVersion[]>([]);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(false);
   const [output, setOutput] = useState('');
   const [outputType, setOutputType] = useState<'success' | 'error' | 'info'>('info');
   const [loading, setLoading] = useState(false);
@@ -91,12 +92,25 @@ export default function KvExplorer() {
   };
 
   const handleVersions = async (k: string) => {
-    if (expandedKey === k) { setExpandedKey(null); setVersions([]); return; }
+    if (expandedKey === k) {
+      setExpandedKey(null);
+      setVersions([]);
+      return;
+    }
     setExpandedKey(k);
+    setVersions([]);
+    setVersionsLoading(true);
     try {
       const res = await fetch(`${getApiBase()}/kv/versions/${encodeURIComponent(k)}`);
-      if (res.ok) { const data = await res.json(); setVersions(Array.isArray(data) ? data : (data.versions || [])); }
-    } catch { setVersions([]); }
+      if (res.ok) {
+        const data = await res.json();
+        setVersions(Array.isArray(data) ? data : (data.versions || []));
+      }
+    } catch {
+      setVersions([]);
+    } finally {
+      setVersionsLoading(false);
+    }
   };
 
   const addTxnOp = () => setTxnOps([...txnOps, { type: 'PUT', key: '', value: '' }]);
@@ -288,43 +302,133 @@ export default function KvExplorer() {
             )}
           </div>
           <div className="flex-1 overflow-y-auto">
-            <table className="w-full text-sm">
+            <table className="w-full table-fixed text-sm">
               <thead className="sticky top-0 bg-surface-800/80 backdrop-blur-sm z-10">
                 <tr className="text-left text-[10px] text-white/25 uppercase tracking-wider">
-                  <th className="px-4 py-2.5 w-8">#</th>
-                  <th className="px-4 py-2.5">Key</th>
+                  <th className="px-4 py-2.5 w-12">#</th>
+                  <th className="px-4 py-2.5 w-48">Key</th>
                   <th className="px-4 py-2.5">Value</th>
-                  <th className="px-4 py-2.5 w-28">Version</th>
-                  <th className="px-4 py-2.5 w-24">History</th>
+                  <th className="px-4 py-2.5 w-24 text-center">Version</th>
+                  <th className="px-4 py-2.5 w-24 text-right">History</th>
                 </tr>
               </thead>
               <tbody>
-                <AnimatePresence>
-                  {results.map((pair, i) => (
-                    <motion.tr
-                      key={pair.key}
-                      initial={{ opacity: 0, y: 4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ delay: i * 0.03 }}
-                      className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors group"
-                    >
-                      <td className="px-4 py-2.5 text-white/15 text-xs font-mono">{i + 1}</td>
-                      <td className="px-4 py-2.5 font-mono text-brand-400 text-xs">{pair.key}</td>
-                      <td className="px-4 py-2.5 font-mono text-white/60 text-xs truncate max-w-xs">{pair.value}</td>
-                      <td className="px-4 py-2.5 text-white/25 text-xs font-mono">v{pair.version || '?'}</td>
-                      <td className="px-4 py-2.5">
-                        <button
-                          onClick={() => handleVersions(pair.key)}
-                          className="flex items-center gap-1 text-[11px] text-purple-400/60 hover:text-purple-400 transition-colors"
-                        >
-                          {expandedKey === pair.key ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                          <Clock className="w-3 h-3" />
-                          MVCC
-                        </button>
-                      </td>
-                    </motion.tr>
-                  ))}
-                </AnimatePresence>
+                {results.map((pair, i) => {
+                  const isExpanded = expandedKey === pair.key;
+                  return (
+                    <Fragment key={pair.key}>
+                      <tr
+                        className={`border-b transition-colors ${
+                          isExpanded
+                            ? 'bg-purple-500/[0.08] border-purple-500/30'
+                            : 'border-white/[0.03] hover:bg-white/[0.02]'
+                        }`}
+                      >
+                        <td className="px-4 py-2.5 text-white/15 text-xs font-mono">{i + 1}</td>
+                        <td className="px-4 py-2.5 font-mono text-brand-400 text-xs font-medium truncate" title={pair.key}>{pair.key}</td>
+                        <td className="px-4 py-2.5 font-mono text-white/60 text-xs truncate" title={pair.value}>{pair.value}</td>
+                        <td className="px-4 py-2.5 text-white/25 text-xs font-mono text-center">v{pair.version || '?'}</td>
+                        <td className="px-4 py-2.5 text-right">
+                          <button
+                            onClick={() => handleVersions(pair.key)}
+                            className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded transition-all ${
+                              isExpanded
+                                ? 'text-purple-300 bg-purple-500/20 font-medium'
+                                : 'text-purple-400/60 hover:text-purple-300 hover:bg-purple-500/10'
+                            }`}
+                          >
+                            {isExpanded ? <ChevronDown className="w-3 h-3 text-purple-400" /> : <ChevronRight className="w-3 h-3" />}
+                            <Clock className="w-3 h-3" />
+                            MVCC
+                          </button>
+                        </td>
+                      </tr>
+
+                      {/* Expand directly under chosen row */}
+                      {isExpanded && (
+                        <tr className="bg-surface-900/90 border-b border-purple-500/20">
+                          <td colSpan={5} className="p-0">
+                            <motion.div
+                              initial={{ opacity: 0, height: 0 }}
+                              animate={{ opacity: 1, height: 'auto' }}
+                              exit={{ opacity: 0, height: 0 }}
+                              transition={{ duration: 0.15 }}
+                              className="overflow-hidden w-full"
+                            >
+                              <div className="mx-3 my-2.5 bg-purple-500/[0.04] border border-purple-500/15 rounded-xl p-3.5 shadow-inner overflow-hidden">
+                                <div className="flex items-center justify-between mb-2.5 min-w-0">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <GitBranch className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+                                    <h4 className="text-xs font-semibold text-purple-300 truncate">
+                                      Version History — <span className="font-mono text-white/90">{pair.key}</span>
+                                    </h4>
+                                    {!versionsLoading && versions.length > 0 && (
+                                      <span className="text-[10px] font-mono text-purple-300 bg-purple-500/15 px-2 py-0.5 rounded-full border border-purple-500/20 flex-shrink-0">
+                                        {versions.length} {versions.length === 1 ? 'version' : 'versions'}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <button
+                                    onClick={() => { setExpandedKey(null); setVersions([]); }}
+                                    className="text-white/30 hover:text-white/70 p-1 rounded hover:bg-white/[0.05] transition-colors flex-shrink-0 ml-2"
+                                    title="Close"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+
+                                {versionsLoading ? (
+                                  <div className="flex items-center gap-2 py-3 px-2 text-xs text-purple-300/60 font-mono">
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
+                                    <span>Fetching MVCC version chain...</span>
+                                  </div>
+                                ) : versions.length === 0 ? (
+                                  <div className="text-xs text-white/30 py-2.5 px-2 font-mono">
+                                    No historical versions found for this key.
+                                  </div>
+                                ) : (
+                                  <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                                    {versions.map((v, idx) => (
+                                      <div
+                                        key={v.timestamp ? `${v.timestamp}-${idx}` : idx}
+                                        className="flex items-center gap-3 text-xs font-mono py-1.5 px-2.5 rounded-lg bg-white/[0.02] border border-white/[0.03] hover:bg-white/[0.04] transition-colors min-w-0"
+                                      >
+                                        <span className="text-white/20 w-5 flex-shrink-0">{idx + 1}.</span>
+                                        <Clock className="w-3 h-3 text-white/30 flex-shrink-0" />
+                                        <span className="text-white/40 w-44 flex-shrink-0">
+                                          {new Date(v.timestamp).toLocaleString()}
+                                        </span>
+                                        {v.versionState && (
+                                          <span className={`text-[10px] px-1.5 py-0.5 rounded-md border font-semibold flex-shrink-0 ${
+                                            v.versionState === 'SPECULATIVE'
+                                              ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+                                              : v.versionState === 'COMMITTED'
+                                              ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                                              : 'text-red-400 bg-red-500/10 border-red-500/20'
+                                          }`}>
+                                            {v.versionState}
+                                          </span>
+                                        )}
+                                        <span
+                                          className={`truncate min-w-0 flex-1 ${
+                                            v.tombstone ? 'text-red-400/70 line-through' : 'text-white/70'
+                                          }`}
+                                          title={v.value || ''}
+                                        >
+                                          {v.tombstone ? '(tombstone - deleted)' : v.value}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </motion.div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
                 {results.length === 0 && (
                   <tr>
                     <td colSpan={5} className="text-center py-16">
@@ -338,50 +442,6 @@ export default function KvExplorer() {
                 )}
               </tbody>
             </table>
-
-            {/* MVCC Version Viewer */}
-            <AnimatePresence>
-              {expandedKey && versions.length > 0 && (
-                <motion.div
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  className="mx-4 mb-4 overflow-hidden"
-                >
-                  <div className="bg-purple-500/5 border border-purple-500/10 rounded-xl p-4">
-                    <div className="flex items-center gap-2 mb-3">
-                      <GitBranch className="w-3.5 h-3.5 text-purple-400" />
-                      <h4 className="text-xs font-semibold text-purple-400">
-                        Version History — <span className="font-mono">{expandedKey}</span>
-                      </h4>
-                    </div>
-                    <div className="space-y-1.5">
-                      {versions.map((v, i) => (
-                        <div key={v.timestamp} className="flex items-center gap-3 text-xs font-mono">
-                          <span className="text-white/15 w-5">{i + 1}.</span>
-                          <Clock className="w-3 h-3 text-white/20" />
-                          <span className="text-white/30 w-40">{new Date(v.timestamp).toLocaleString()}</span>
-                          {v.versionState && (
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded-md border font-semibold ${
-                              v.versionState === 'SPECULATIVE'
-                                ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
-                                : v.versionState === 'COMMITTED'
-                                ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
-                                : 'text-red-400 bg-red-500/10 border-red-500/20'
-                            }`}>
-                              {v.versionState}
-                            </span>
-                          )}
-                          <span className={v.tombstone ? 'text-red-400/70 line-through' : 'text-white/60'}>
-                            {v.tombstone ? '(deleted)' : v.value}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
           </div>
         </div>
       </div>

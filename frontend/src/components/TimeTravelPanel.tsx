@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useClusterStore } from '../stores/clusterStore';
 import type {
@@ -9,15 +9,34 @@ import type {
   KeyAuditTrail,
   VersionDiffResult,
   RetentionWatermark,
+  BitemporalTimelineResponse,
+  StateDetailEntry,
 } from '../types/chronos';
 import {
   Clock, History, Search, GitCompare, Camera, ShieldAlert,
   Calendar, Layers, CheckCircle2, AlertTriangle, ArrowRight,
-  Database, RefreshCw, Loader2, Sparkles, Sliders, ShieldCheck, X
+  Database, RefreshCw, Loader2, Sparkles, Sliders, ShieldCheck, X,
+  Play, Hourglass, Info
 } from 'lucide-react';
 
 function getApiBase() {
   return useClusterStore.getState().apiBaseUrl || '/api';
+}
+
+function formatTimestamp(ts?: number | null) {
+  if (ts === null || ts === undefined) return '—';
+  if (ts >= 9223372036854775000 || ts >= 253402300799000) return '∞ (Open-ended)';
+  return new Date(ts).toLocaleString();
+}
+
+function formatValidInterval(from?: number | null, to?: number | null) {
+  const fromStr = (from !== null && from !== undefined && from > 0)
+    ? new Date(from).toLocaleDateString()
+    : 'Epoch';
+  const toStr = (to !== null && to !== undefined && to < 9223372036854775000 && to < 253402300799000)
+    ? new Date(to).toLocaleDateString()
+    : '∞';
+  return `[${fromStr} → ${toStr})`;
 }
 
 export default function TimeTravelPanel() {
@@ -28,6 +47,8 @@ export default function TimeTravelPanel() {
   const [readMode, setReadMode] = useState<ReadMode>('LINEARIZABLE');
   const [selectedVersion, setSelectedVersion] = useState('');
   const [asOfTimestamp, setAsOfTimestamp] = useState<string>('');
+  const [validTime, setValidTime] = useState<string>(() => new Date().toISOString().slice(0, 16));
+  const [bitemporalTtMode, setBitemporalTtMode] = useState<'VERSION' | 'TIME'>('VERSION');
   const [selectedSnapshot, setSelectedSnapshot] = useState('');
   const [queryKey, setQueryKey] = useState('');
 
@@ -43,12 +64,20 @@ export default function TimeTravelPanel() {
   const [diffBaseVer, setDiffBaseVer] = useState('');
   const [diffTargetVer, setDiffTargetVer] = useState('');
 
+  // Bitemporal Timeline modal/details
+  const [bitemporalTimelineKey, setBitemporalTimelineKey] = useState<string | null>(null);
+  const [bitemporalTimelineData, setBitemporalTimelineData] = useState<BitemporalTimelineResponse | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [auditViewMode, setAuditViewMode] = useState<'trail' | 'timeline'>('trail');
+
   // UI state
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [historyPruned, setHistoryPruned] = useState(false);
   const [snapshotName, setSnapshotName] = useState('');
   const [snapshotSuccess, setSnapshotSuccess] = useState<string | null>(null);
+  const [demoRunning, setDemoRunning] = useState(false);
+  const [demoNotice, setDemoNotice] = useState<string | null>(null);
 
   // Fetch version list and retention stats on mount
   const refreshMetadata = useCallback(async () => {
@@ -109,6 +138,20 @@ export default function TimeTravelPanel() {
         payload.timestamp = !isNaN(parsed) ? parsed : Date.now();
       }
       if (queryMode === 'AS_OF_SNAPSHOT') payload.snapshotId = selectedSnapshot;
+      if (queryMode === 'AS_OF_VALID_TIME') {
+        const parsedVt = Date.parse(validTime);
+        payload.validTime = !isNaN(parsedVt) ? parsedVt : Date.now();
+      }
+      if (queryMode === 'BITEMPORAL') {
+        const parsedVt = Date.parse(validTime);
+        payload.validTime = !isNaN(parsedVt) ? parsedVt : Date.now();
+        if (bitemporalTtMode === 'VERSION') {
+          payload.versionId = selectedVersion;
+        } else {
+          const parsedTt = Date.parse(asOfTimestamp);
+          payload.timestamp = !isNaN(parsedTt) ? parsedTt : Date.now();
+        }
+      }
 
       const res = await fetch(`${getApiBase()}/chronos/state`, {
         method: 'POST',
@@ -132,6 +175,7 @@ export default function TimeTravelPanel() {
         setDbState({
           ...data,
           keys: keysMap,
+          details: data.details || [],
           totalKeys: total,
           asOfVersionId: data.asOfVersionId || data.versionId || 'V_HEAD',
           executionTimeMs: data.executionTimeMs ?? data.latencyMs ?? 0,
@@ -142,12 +186,31 @@ export default function TimeTravelPanel() {
     } finally {
       setLoading(false);
     }
-  }, [queryMode, readMode, selectedVersion, asOfTimestamp, selectedSnapshot]);
+  }, [queryMode, readMode, selectedVersion, asOfTimestamp, validTime, bitemporalTtMode, selectedSnapshot]);
 
   // Auto-run reconstruction when query parameters change or on mount
   useEffect(() => {
     executeReconstruction();
   }, [executeReconstruction]);
+
+  // Fetch Bitemporal Timeline for a specific key
+  const fetchBitemporalTimeline = async (targetKey: string) => {
+    setTimelineLoading(true);
+    setBitemporalTimelineKey(targetKey);
+    try {
+      const res = await fetch(`${getApiBase()}/chronos/bitemporal/timeline/${encodeURIComponent(targetKey.trim())}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBitemporalTimelineData(data);
+      } else {
+        setErrorMsg(`Failed to fetch bitemporal timeline for ${targetKey}`);
+      }
+    } catch (err: any) {
+      setErrorMsg('Timeline error: ' + err.message);
+    } finally {
+      setTimelineLoading(false);
+    }
+  };
 
   // Execute Key Audit Query
   const executeAudit = async (targetKey?: string) => {
@@ -156,15 +219,24 @@ export default function TimeTravelPanel() {
     setLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetch(`${getApiBase()}/chronos/audit/${encodeURIComponent(k.trim())}`);
-      if (res.status === 410) {
+      const [auditRes, timelineRes] = await Promise.all([
+        fetch(`${getApiBase()}/chronos/audit/${encodeURIComponent(k.trim())}`),
+        fetch(`${getApiBase()}/chronos/bitemporal/timeline/${encodeURIComponent(k.trim())}`),
+      ]);
+
+      if (auditRes.status === 410) {
         setHistoryPruned(true);
         setErrorMsg('Some audit history for this key was pruned beyond the low watermark');
-      } else if (!res.ok) {
-        setErrorMsg(`Audit lookup failed (${res.status})`);
+      } else if (!auditRes.ok) {
+        setErrorMsg(`Audit lookup failed (${auditRes.status})`);
       } else {
-        const data = await res.json();
+        const data = await auditRes.json();
         setAuditTrail(data);
+      }
+
+      if (timelineRes.ok) {
+        const timeData = await timelineRes.json();
+        setBitemporalTimelineData(timeData);
       }
     } catch (e: any) {
       setErrorMsg(e.message || 'Audit lookup error');
@@ -216,10 +288,84 @@ export default function TimeTravelPanel() {
     }
   };
 
+  // Interactive 1-Click Bitemporal Retroactive Demo Scenario
+  const runBitemporalDemo = async () => {
+    setDemoRunning(true);
+    setDemoNotice('Populating 3-step Retroactive Payroll Compensation scenario...');
+    try {
+      const baseDate = new Date('2026-01-01T09:00:00Z').getTime();
+      const promoDate = new Date('2026-06-01T09:00:00Z').getTime();
+      const retroStart = new Date('2026-02-01T09:00:00Z').getTime();
+      const retroEnd = new Date('2026-04-01T09:00:00Z').getTime();
+
+      // Step 1: Base compensation contract effective Jan 1, 2026
+      await fetch(`${getApiBase()}/chronos/write`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: 'employee:alice:salary',
+          value: '$80,000/yr (Base Contract)',
+          validFrom: baseDate,
+          validTo: null,
+          writerId: 'hr-onboarding',
+        }),
+      });
+
+      // Step 2: Mid-year promotion effective Jun 1, 2026
+      await fetch(`${getApiBase()}/chronos/write`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: 'employee:alice:salary',
+          value: '$95,000/yr (Senior Promo)',
+          validFrom: promoDate,
+          validTo: null,
+          writerId: 'hr-promotion-board',
+        }),
+      });
+
+      // Step 3: Retroactive Audit Correction (Effective Feb 1 - Apr 1 adjusted to $88,000)
+      await fetch(`${getApiBase()}/chronos/write`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: 'employee:alice:salary',
+          value: '$88,000/yr (Retroactive Equity Adjustment)',
+          validFrom: retroStart,
+          validTo: retroEnd,
+          writerId: 'internal-audit',
+        }),
+      });
+
+      await refreshMetadata();
+      setQueryMode('AS_OF_VALID_TIME');
+      setValidTime('2026-02-15T12:00');
+      setDemoNotice(
+        'Scenario active! "employee:alice:salary" populated. Reconstructing state effective Feb 15, 2026 returns retroactive $88,000!'
+      );
+      setTimeout(() => setDemoNotice(null), 9000);
+    } catch (e: any) {
+      setErrorMsg('Demo failed: ' + e.message);
+    } finally {
+      setDemoRunning(false);
+    }
+  };
+
+  // Map key details for fast table lookup
+  const detailsMap = useMemo(() => {
+    const map = new Map<string, StateDetailEntry>();
+    if (dbState?.details) {
+      for (const d of dbState.details) {
+        map.set(d.key, d);
+      }
+    }
+    return map;
+  }, [dbState]);
+
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-surface-950 p-6 space-y-5">
-      {/* Top Banner / Watermark Stats */}
-      <div className="flex items-center justify-between bg-surface-900/70 border border-white/[0.08] rounded-2xl px-6 py-4 backdrop-blur-xl shadow-lg">
+      {/* Top Banner / Watermark Stats / Demo Trigger */}
+      <div className="flex flex-wrap items-center justify-between gap-4 bg-surface-900/70 border border-white/[0.08] rounded-2xl px-6 py-4 backdrop-blur-xl shadow-lg">
         <div className="flex items-center gap-4">
           <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-purple-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
             <History className="w-6 h-6" />
@@ -230,38 +376,72 @@ export default function TimeTravelPanel() {
               <span className="px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                 MVCC DAG
               </span>
+              <span className="px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                2D Bitemporal (Tv / Tt)
+              </span>
             </div>
             <p className="text-xs text-white/50 mt-0.5">
-              Reconstruct exact point-in-time database states, inspect key mutation lineages, and audit version diffs.
+              Reconstruct point-in-time database states, evaluate valid-time intervals, and audit version DAG lineages.
             </p>
           </div>
         </div>
 
-        {/* Retention Watermark Pill */}
-        {watermark && (
-          <div className="flex items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-xl px-4 py-2 text-xs">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <div>
-              <span className="text-white/40 block text-[10px]">Safe Low-Watermark</span>
-              <span className="font-mono text-emerald-300 font-semibold">
-                Seq ≥ {watermark.watermark?.earliestAvailableSeq ?? 0}
-              </span>
+        <div className="flex items-center gap-3">
+          {/* 1-Click Interactive Bitemporal Demo Button */}
+          <button
+            onClick={runBitemporalDemo}
+            disabled={demoRunning}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white shadow-md shadow-indigo-600/20 transition disabled:opacity-50"
+            title="Populate a 3-step retroactive payroll contract scenario"
+          >
+            {demoRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-amber-300" />}
+            <span>Run Retroactive Adjustment Demo</span>
+          </button>
+
+          {/* Retention Watermark Pill */}
+          {watermark && (
+            <div className="flex items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-xl px-4 py-2 text-xs">
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              <div>
+                <span className="text-white/40 block text-[10px]">Safe Low-Watermark</span>
+                <span className="font-mono text-emerald-300 font-semibold">
+                  Seq ≥ {watermark.watermark?.earliestAvailableSeq ?? 0}
+                </span>
+              </div>
+              <div className="h-6 w-px bg-white/10 mx-1" />
+              <div>
+                <span className="text-white/40 block text-[10px]">Active Read Leases</span>
+                <span className="font-mono text-cyan-300 font-semibold">{watermark.activeReadPins ?? 0}</span>
+              </div>
             </div>
-            <div className="h-6 w-px bg-white/10 mx-1" />
-            <div>
-              <span className="text-white/40 block text-[10px]">Active Read Leases</span>
-              <span className="font-mono text-cyan-300 font-semibold">{watermark.activeReadPins ?? 0}</span>
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
+
+      {/* Demo Notification Banner */}
+      <AnimatePresence>
+        {demoNotice && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="flex items-center gap-3 bg-indigo-950/70 border border-indigo-500/40 rounded-xl px-4 py-3 text-indigo-200 text-xs shadow-md"
+          >
+            <Sparkles className="w-4 h-4 text-amber-300 shrink-0" />
+            <div className="flex-1 font-medium">{demoNotice}</div>
+            <button onClick={() => setDemoNotice(null)} className="text-white/40 hover:text-white">
+              <X className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Navigation Sub-tabs */}
       <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
         <div className="flex items-center gap-1.5 bg-surface-900/60 p-1 rounded-xl border border-white/[0.06]">
           {[
             { id: 'reconstruction', label: 'Database As-Of', icon: Database },
-            { id: 'audit', label: 'Key Provenance', icon: Clock },
+            { id: 'audit', label: 'Key Provenance & Timeline', icon: Clock },
             { id: 'diff', label: 'Version Diff', icon: GitCompare },
             { id: 'retention', label: 'Retention & Snapshots', icon: Camera },
           ].map((tab) => {
@@ -343,14 +523,25 @@ export default function TimeTravelPanel() {
                   <label className="text-[11px] font-semibold text-white/50 uppercase tracking-wider block mb-1.5">
                     Temporal Mode
                   </label>
-                  <div className="flex items-center gap-1 bg-surface-950 p-1 rounded-xl border border-white/[0.06]">
-                    {(['CURRENT', 'AS_OF_VERSION', 'AS_OF_TIME', 'AS_OF_SNAPSHOT'] as QueryMode[]).map((mode) => (
+                  <div className="flex flex-wrap items-center gap-1 bg-surface-950 p-1 rounded-xl border border-white/[0.06]">
+                    {([
+                      'CURRENT',
+                      'AS_OF_VERSION',
+                      'AS_OF_TIME',
+                      'AS_OF_SNAPSHOT',
+                      'AS_OF_VALID_TIME',
+                      'BITEMPORAL',
+                    ] as QueryMode[]).map((mode) => (
                       <button
                         key={mode}
                         onClick={() => setQueryMode(mode)}
                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
                           queryMode === mode
-                            ? 'bg-indigo-600 text-white shadow-sm'
+                            ? mode === 'BITEMPORAL'
+                              ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-sm'
+                              : mode === 'AS_OF_VALID_TIME'
+                              ? 'bg-emerald-600 text-white shadow-sm'
+                              : 'bg-indigo-600 text-white shadow-sm'
                             : 'text-white/50 hover:text-white/80'
                         }`}
                       >
@@ -387,7 +578,7 @@ export default function TimeTravelPanel() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-white/[0.04]">
                 {queryMode === 'AS_OF_VERSION' && (
                   <div className="col-span-2">
-                    <label className="text-xs text-white/60 block mb-1">Target Version ID</label>
+                    <label className="text-xs text-white/60 block mb-1">Target Version ID (Transaction Time Tt)</label>
                     <select
                       value={selectedVersion}
                       onChange={(e) => setSelectedVersion(e.target.value)}
@@ -404,7 +595,7 @@ export default function TimeTravelPanel() {
 
                 {queryMode === 'AS_OF_TIME' && (
                   <div className="col-span-2">
-                    <label className="text-xs text-white/60 block mb-1">Historical Timestamp</label>
+                    <label className="text-xs text-white/60 block mb-1">Historical Transaction-Time (Tt)</label>
                     <div className="flex items-center gap-2">
                       <input
                         type="datetime-local"
@@ -423,6 +614,12 @@ export default function TimeTravelPanel() {
                         className="px-2.5 py-2 text-xs bg-white/[0.04] hover:bg-white/[0.08] rounded-xl text-white/60"
                       >
                         -5m
+                      </button>
+                      <button
+                        onClick={() => setAsOfTimestamp(new Date(Date.now() - 3600000).toISOString().slice(0, 16))}
+                        className="px-2.5 py-2 text-xs bg-white/[0.04] hover:bg-white/[0.08] rounded-xl text-white/60"
+                      >
+                        -1h
                       </button>
                     </div>
                   </div>
@@ -443,6 +640,105 @@ export default function TimeTravelPanel() {
                   </div>
                 )}
 
+                {queryMode === 'AS_OF_VALID_TIME' && (
+                  <div className="col-span-2">
+                    <label className="text-xs text-emerald-400 font-medium block mb-1 flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>Valid-Time (Tv) — Real-World Effective Point</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="datetime-local"
+                        value={validTime}
+                        onChange={(e) => setValidTime(e.target.value)}
+                        className="flex-1 bg-surface-950 border border-emerald-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                      />
+                      <button
+                        onClick={() => setValidTime('2026-02-15T12:00')}
+                        className="px-2.5 py-2 text-xs bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 rounded-xl border border-emerald-500/20"
+                        title="Jump to retroactive demo date"
+                      >
+                        Demo Date
+                      </button>
+                      <button
+                        onClick={() => setValidTime(new Date().toISOString().slice(0, 16))}
+                        className="px-2.5 py-2 text-xs bg-white/[0.04] hover:bg-white/[0.08] rounded-xl text-white/60"
+                      >
+                        Now
+                      </button>
+                    </div>
+                    <span className="text-[11px] text-white/40 block mt-1">
+                      Evaluates reality effective at Tv using all currently committed transaction knowledge.
+                    </span>
+                  </div>
+                )}
+
+                {queryMode === 'BITEMPORAL' && (
+                  <div className="col-span-2 space-y-2">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs text-emerald-400 font-medium block mb-1 flex items-center gap-1">
+                          <Calendar className="w-3.5 h-3.5" />
+                          <span>Dimension 1: Valid-Time (Tv)</span>
+                        </label>
+                        <input
+                          type="datetime-local"
+                          value={validTime}
+                          onChange={(e) => setValidTime(e.target.value)}
+                          className="w-full bg-surface-950 border border-emerald-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-xs text-purple-400 font-medium flex items-center gap-1">
+                            <Clock className="w-3.5 h-3.5" />
+                            <span>Dimension 2: System Time (Tt)</span>
+                          </label>
+                          <div className="flex items-center gap-1 text-[10px]">
+                            <button
+                              type="button"
+                              onClick={() => setBitemporalTtMode('VERSION')}
+                              className={`px-1.5 py-0.5 rounded ${bitemporalTtMode === 'VERSION' ? 'bg-purple-600 text-white' : 'text-white/40'}`}
+                            >
+                              Ver
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setBitemporalTtMode('TIME')}
+                              className={`px-1.5 py-0.5 rounded ${bitemporalTtMode === 'TIME' ? 'bg-purple-600 text-white' : 'text-white/40'}`}
+                            >
+                              Time
+                            </button>
+                          </div>
+                        </div>
+                        {bitemporalTtMode === 'VERSION' ? (
+                          <select
+                            value={selectedVersion}
+                            onChange={(e) => setSelectedVersion(e.target.value)}
+                            className="w-full bg-surface-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-purple-500"
+                          >
+                            {versions.map((v) => (
+                              <option key={v.versionId} value={v.versionId}>
+                                {v.versionId} (seq={v.sequence})
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type="datetime-local"
+                            value={asOfTimestamp}
+                            onChange={(e) => setAsOfTimestamp(e.target.value)}
+                            className="w-full bg-surface-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-purple-500"
+                          />
+                        )}
+                      </div>
+                    </div>
+                    <div className="text-[11px] text-white/40 bg-white/[0.02] p-2 rounded-lg border border-white/[0.04]">
+                      2D Intersection: Reconstructs state effective at valid-time <strong className="text-emerald-300">Tv</strong> as was recorded up to system commit <strong className="text-purple-300">Tt</strong>.
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex items-end">
                   <button
                     onClick={executeReconstruction}
@@ -459,7 +755,7 @@ export default function TimeTravelPanel() {
             {/* Reconstructed Table Results */}
             {dbState && (
               <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-3">
                     <h3 className="text-xs font-bold text-white uppercase tracking-wider">
                       Reconstructed State Table ({dbState.totalKeys} keys)
@@ -479,31 +775,62 @@ export default function TimeTravelPanel() {
                       <tr>
                         <th className="py-2.5 px-4 font-semibold">Key</th>
                         <th className="py-2.5 px-4 font-semibold">Value</th>
+                        <th className="py-2.5 px-4 font-semibold">Valid Interval (Tv)</th>
+                        <th className="py-2.5 px-4 font-semibold">Tx System (Tt)</th>
                         <th className="py-2.5 px-4 font-semibold text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/[0.04]">
-                      {Object.entries(dbState.keys).map(([k, v]) => (
-                        <tr key={k} className="hover:bg-white/[0.02] transition">
-                          <td className="py-2 px-4 font-mono text-cyan-300 font-medium">{k}</td>
-                          <td className="py-2 px-4 font-mono text-white/80 max-w-md truncate">{v}</td>
-                          <td className="py-2 px-4 text-right">
-                            <button
-                              onClick={() => {
-                                setQueryKey(k);
-                                setSubTab('audit');
-                                executeAudit(k);
-                              }}
-                              className="text-xs text-indigo-400 hover:text-indigo-300 hover:underline"
-                            >
-                              Audit History
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {Object.entries(dbState.keys).map(([k, v]) => {
+                        const detail = detailsMap.get(k);
+                        const hasInterval = detail && (detail.validFrom !== null || detail.validTo !== null);
+                        return (
+                          <tr key={k} className="hover:bg-white/[0.02] transition">
+                            <td className="py-2.5 px-4 font-mono text-cyan-300 font-medium">{k}</td>
+                            <td className="py-2.5 px-4 font-mono text-white/90 max-w-xs truncate">{v}</td>
+                            <td className="py-2.5 px-4 font-mono text-[11px]">
+                              {hasInterval ? (
+                                <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                                  {formatValidInterval(detail.validFrom, detail.validTo)}
+                                </span>
+                              ) : (
+                                <span className="text-white/40">[Epoch → ∞)</span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-4 font-mono text-[11px] text-white/60">
+                              {detail ? (
+                                <span>{detail.versionId} ({new Date(detail.timestamp).toLocaleTimeString()})</span>
+                              ) : (
+                                <span>{dbState.asOfVersionId}</span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-4 text-right space-x-2">
+                              <button
+                                onClick={() => fetchBitemporalTimeline(k)}
+                                className="text-xs text-emerald-400 hover:text-emerald-300 hover:underline inline-flex items-center gap-1"
+                                title="View 2D Bitemporal Timeline"
+                              >
+                                <Calendar className="w-3 h-3" />
+                                <span>Timeline</span>
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setQueryKey(k);
+                                  setSubTab('audit');
+                                  executeAudit(k);
+                                }}
+                                className="text-xs text-indigo-400 hover:text-indigo-300 hover:underline inline-flex items-center gap-1"
+                              >
+                                <Clock className="w-3 h-3" />
+                                <span>Audit</span>
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {Object.keys(dbState.keys).length === 0 && (
                         <tr>
-                          <td colSpan={3} className="py-6 text-center text-white/40">
+                          <td colSpan={5} className="py-6 text-center text-white/40">
                             No keys existed in database at this historical point.
                           </td>
                         </tr>
@@ -516,13 +843,13 @@ export default function TimeTravelPanel() {
           </div>
         )}
 
-        {/* SUBTAB 2: KEY PROVENANCE AUDIT */}
+        {/* SUBTAB 2: KEY PROVENANCE AUDIT & 2D BITEMPORAL TIMELINE */}
         {subTab === 'audit' && (
           <div className="space-y-4">
-            <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl flex items-center gap-3">
+            <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl flex flex-wrap items-center gap-3">
               <input
                 type="text"
-                placeholder="Enter key to trace (e.g. counter, balance:acc1)..."
+                placeholder="Enter key to trace (e.g. employee:alice:salary, counter)..."
                 value={queryKey}
                 onChange={(e) => setQueryKey(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && executeAudit()}
@@ -538,7 +865,35 @@ export default function TimeTravelPanel() {
               </button>
             </div>
 
-            {auditTrail && (
+            {/* Audit / Timeline Toggle */}
+            {(auditTrail || bitemporalTimelineData) && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setAuditViewMode('trail')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                    auditViewMode === 'trail'
+                      ? 'bg-indigo-600 text-white shadow-sm'
+                      : 'bg-white/[0.04] text-white/50 hover:text-white'
+                  }`}
+                >
+                  Mutation Log Trail ({auditTrail?.totalModifications ?? 0})
+                </button>
+                <button
+                  onClick={() => setAuditViewMode('timeline')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                    auditViewMode === 'timeline'
+                      ? 'bg-emerald-600 text-white shadow-sm'
+                      : 'bg-white/[0.04] text-white/50 hover:text-white'
+                  }`}
+                >
+                  <Calendar className="w-3.5 h-3.5" />
+                  <span>2D Bitemporal Intervals ({bitemporalTimelineData?.timeline?.length ?? 0})</span>
+                </button>
+              </div>
+            )}
+
+            {/* VIEW 1: Standard Audit Trail */}
+            {auditViewMode === 'trail' && auditTrail && (
               <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl space-y-4">
                 <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
                   <div>
@@ -581,6 +936,65 @@ export default function TimeTravelPanel() {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            )}
+
+            {/* VIEW 2: 2D Bitemporal Intervals View */}
+            {auditViewMode === 'timeline' && bitemporalTimelineData && (
+              <div className="bg-surface-900/60 border border-white/[0.06] rounded-2xl p-5 backdrop-blur-xl space-y-4">
+                <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-white font-mono">{bitemporalTimelineData.key}</h3>
+                    <p className="text-xs text-white/50">
+                      2D Bitemporal Interval Mapping ({bitemporalTimelineData.timeline.length} recorded versions)
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-3">
+                  {bitemporalTimelineData.timeline.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="bg-surface-950 border border-white/[0.06] rounded-xl p-4 text-xs space-y-2 hover:border-emerald-500/30 transition"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-purple-300">{item.versionId}</span>
+                          <span className="text-white/40">seq={item.sequence}</span>
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                            {item.opType}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-white/40">
+                          Recorded at Tt: <span className="text-white/70 font-mono">{new Date(item.txnTime).toLocaleString()}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-3 pt-1 border-t border-white/[0.04]">
+                        <div className="flex items-center gap-1.5">
+                          <Calendar className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="text-white/50">Valid-Time Window (Tv):</span>
+                          <span className="font-mono font-semibold text-emerald-300">
+                            {formatValidInterval(item.validFrom, item.validTo)}
+                          </span>
+                        </div>
+                        <div className="text-white/30">•</div>
+                        <div className="text-white/50">
+                          Writer: <span className="font-mono text-white/80">{item.writerId}</span>
+                        </div>
+                      </div>
+
+                      <div className="bg-black/40 rounded-lg p-2.5 font-mono text-[11px] text-emerald-300">
+                        {item.value || '<deleted>'}
+                      </div>
+                    </div>
+                  ))}
+                  {bitemporalTimelineData.timeline.length === 0 && (
+                    <div className="py-6 text-center text-white/40 text-xs">
+                      No mutations recorded for key {bitemporalTimelineData.key}.
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -778,7 +1192,100 @@ export default function TimeTravelPanel() {
           </div>
         )}
       </div>
+
+      {/* 2D Bitemporal Timeline Modal */}
+      <AnimatePresence>
+        {bitemporalTimelineKey && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-surface-900 border border-white/[0.1] rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-2xl max-h-[85vh] flex flex-col"
+            >
+              <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                <div className="flex items-center gap-2">
+                  <Calendar className="w-5 h-5 text-emerald-400" />
+                  <div>
+                    <h3 className="text-sm font-bold text-white font-mono">{bitemporalTimelineKey}</h3>
+                    <span className="text-xs text-white/50">2D Bitemporal Timeline & Valid Windows</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setBitemporalTimelineKey(null);
+                    setBitemporalTimelineData(null);
+                  }}
+                  className="p-1 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.05]"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto space-y-3">
+                {timelineLoading ? (
+                  <div className="py-12 flex items-center justify-center gap-2 text-white/50 text-xs">
+                    <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+                    <span>Loading timeline...</span>
+                  </div>
+                ) : bitemporalTimelineData?.timeline?.length ? (
+                  bitemporalTimelineData.timeline.map((point, i) => (
+                    <div
+                      key={i}
+                      className="bg-surface-950 border border-white/[0.06] rounded-xl p-3.5 text-xs space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-purple-300">{point.versionId}</span>
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                            {point.opType}
+                          </span>
+                          <span className="text-white/40 font-mono text-[11px]">{point.writerId}</span>
+                        </div>
+                        <span className="text-[10px] text-white/40 font-mono">
+                          Recorded: {new Date(point.txnTime).toLocaleString()}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-[11px]">
+                        <span className="text-white/50">Valid-Time (Tv):</span>
+                        <span className="font-mono text-emerald-300 font-semibold">
+                          {formatValidInterval(point.validFrom, point.validTo)}
+                        </span>
+                      </div>
+
+                      <div className="bg-black/50 rounded p-2 font-mono text-emerald-300 text-[11px]">
+                        {point.value || '<deleted>'}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="py-8 text-center text-white/40 text-xs">
+                    No timeline records found for {bitemporalTimelineKey}.
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2 border-t border-white/[0.06] flex justify-end">
+                <button
+                  onClick={() => {
+                    setBitemporalTimelineKey(null);
+                    setBitemporalTimelineData(null);
+                  }}
+                  className="px-4 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.08] text-xs text-white"
+                >
+                  Close
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
-

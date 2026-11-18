@@ -13,6 +13,8 @@ function getApiBase() {
 }
 
 export default function SpeculationPanel() {
+  const clusterStatus = useClusterStore(s => s.clusterStatus);
+  const setApiBaseUrl = useClusterStore(s => s.setApiBaseUrl);
   const [metrics, setMetrics] = useState<SpeculationMetrics | null>(null);
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResult | null>(null);
   const [gcStressResult, setGcStressResult] = useState<any>(null);
@@ -112,8 +114,19 @@ export default function SpeculationPanel() {
     }
   };
 
-  const speedup = metrics && metrics.avgStandardLatencyMs > 0 && metrics.avgSpeculativeLatencyMs > 0
-    ? (metrics.avgStandardLatencyMs / metrics.avgSpeculativeLatencyMs).toFixed(1)
+  const liveSpecLatency = metrics && metrics.avgSpeculativeLatencyMs > 0 ? metrics.avgSpeculativeLatencyMs : null;
+  const liveStdLatency = metrics && metrics.avgStandardLatencyMs > 0 ? metrics.avgStandardLatencyMs : null;
+
+  const benchSpecLatency = benchmarkResult?.speculative?.writeLatency?.avgMs ?? null;
+  const benchStdLatency = benchmarkResult?.standard?.writeLatency?.avgMs ?? null;
+
+  const displaySpecLatency = liveSpecLatency ?? benchSpecLatency;
+  const displayStdLatency = liveStdLatency ?? benchStdLatency;
+
+  const speedup = displayStdLatency && displaySpecLatency && displaySpecLatency > 0
+    ? (displayStdLatency / displaySpecLatency).toFixed(1)
+    : benchmarkResult?.standard?.writeLatency && benchmarkResult?.speculative?.writeLatency
+    ? (benchmarkResult.standard.writeLatency.p50Ms / benchmarkResult.speculative.writeLatency.p50Ms).toFixed(1)
     : '—';
 
   return (
@@ -128,39 +141,51 @@ export default function SpeculationPanel() {
             Zero-cost rollback via multi-version storage — novel contribution for paper evaluation
           </p>
         </div>
-        <button
-          onClick={toggleSpeculation}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium transition-all ${
-            metrics?.speculationEnabled
-              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-              : 'bg-red-500/10 text-red-400 border border-red-500/20'
-          }`}
-        >
-          {metrics?.speculationEnabled ? (
-            <><ToggleRight className="w-4 h-4" /> Speculation ON</>
-          ) : (
-            <><ToggleLeft className="w-4 h-4" /> Speculation OFF</>
+        <div className="flex items-center gap-2">
+          {clusterStatus && (
+            <div className={`px-2.5 py-1.5 rounded-xl text-[11px] font-semibold flex items-center gap-1.5 border ${
+              clusterStatus.role === 'LEADER'
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${clusterStatus.role === 'LEADER' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+              <span>{clusterStatus.nodeId} ({clusterStatus.role})</span>
+            </div>
           )}
-        </button>
+          <button
+            onClick={toggleSpeculation}
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium transition-all ${
+              metrics?.speculationEnabled
+                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                : 'bg-red-500/10 text-red-400 border border-red-500/20'
+            }`}
+          >
+            {metrics?.speculationEnabled ? (
+              <><ToggleRight className="w-4 h-4" /> Speculation ON</>
+            ) : (
+              <><ToggleLeft className="w-4 h-4" /> Speculation OFF</>
+            )}
+          </button>
+        </div>
       </div>
 
       {/* Live Metrics Cards */}
       <div className="grid grid-cols-4 gap-3">
         <MetricCard
           label="Speculative Write Latency"
-          value={metrics ? `${metrics.avgSpeculativeLatencyMs.toFixed(2)}ms` : '—'}
+          value={displaySpecLatency != null ? `${displaySpecLatency.toFixed(2)}ms` : '—'}
           icon={<Zap className="w-4 h-4 text-amber-400" />}
           color="amber"
         />
         <MetricCard
           label="Standard Write Latency"
-          value={metrics ? `${metrics.avgStandardLatencyMs.toFixed(2)}ms` : '—'}
+          value={displayStdLatency != null ? `${displayStdLatency.toFixed(2)}ms` : '—'}
           icon={<Clock className="w-4 h-4 text-blue-400" />}
           color="blue"
         />
         <MetricCard
           label="Latency Speedup"
-          value={`${speedup}×`}
+          value={speedup !== '—' ? `${speedup}×` : '—'}
           icon={<TrendingUp className="w-4 h-4 text-emerald-400" />}
           color="emerald"
         />
@@ -178,8 +203,18 @@ export default function SpeculationPanel() {
         <div className="glass-card p-5">
           <p className="section-title mb-4">Write Statistics</p>
           <div className="space-y-3">
-            <StatRow label="Speculative Writes" value={metrics?.speculativeWriteCount ?? 0} />
-            <StatRow label="Standard Writes" value={metrics?.standardWriteCount ?? 0} />
+            <StatRow
+              label="Speculative Writes"
+              value={(metrics?.speculativeWriteCount ?? 0) > 0
+                ? metrics?.speculativeWriteCount ?? 0
+                : (benchmarkResult?.speculative?.totalOps ?? 0)}
+            />
+            <StatRow
+              label="Standard Writes"
+              value={(metrics?.standardWriteCount ?? 0) > 0
+                ? metrics?.standardWriteCount ?? 0
+                : (benchmarkResult?.standard?.totalOps ?? 0)}
+            />
             <StatRow label="Commit Promotions" value={metrics?.mvccCommitPromotions ?? 0} />
             <StatRow label="Rollbacks" value={metrics?.mvccRollbacks ?? 0} color="red" />
             <StatRow label="Pending Speculations" value={metrics?.pendingSpeculations ?? 0} color="amber" />
@@ -252,6 +287,31 @@ export default function SpeculationPanel() {
               {benchmarkResult.numOps} ops × {benchmarkResult.concurrency} threads × {benchmarkResult.valueSizeBytes}B
             </span>
           </div>
+
+          {(benchmarkResult as any).error && (
+            <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-300 text-xs flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>{(benchmarkResult as any).error}</span>
+              </div>
+              {clusterStatus?.role !== 'LEADER' && clusterStatus?.leaderId && (
+                <button
+                  onClick={() => {
+                    const portMap: Record<string, string> = {
+                      'node-1': '',
+                      'node-2': 'http://localhost:8082/api',
+                      'node-3': 'http://localhost:8084/api',
+                    };
+                    const target = portMap[clusterStatus.leaderId as string];
+                    if (target !== undefined) setApiBaseUrl(target);
+                  }}
+                  className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 rounded-lg text-[10px] font-semibold tracking-wide transition-all"
+                >
+                  Switch to Leader ({clusterStatus.leaderId})
+                </button>
+              )}
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-4">
             {benchmarkResult.standard && (
@@ -359,38 +419,73 @@ export default function SpeculationPanel() {
 
           {gcStressResult && (
             <div className="mt-3 pt-3 border-t border-white/[0.04] space-y-2 text-xs">
-              <div className="flex justify-between">
-                <span className="text-white/30">Rolled Back</span>
-                <span className="font-mono text-red-400">{gcStressResult.rolledBackCount}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-white/30">GC Duration</span>
-                <span className="font-mono text-white/60">{gcStressResult.gc?.gcDurationMs?.toFixed(2)}ms</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-white/30">Per-version GC</span>
-                <span className="font-mono text-white/60">{gcStressResult.gc?.perVersionGcUs?.toFixed(1)}μs</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-white/30">Throughput Impact</span>
-                <span className={`font-mono font-semibold ${
-                  gcStressResult.throughputComparison?.throughputImpactPercent < 5 ? 'text-emerald-400' : 'text-red-400'
-                }`}>
-                  {gcStressResult.throughputComparison?.throughputImpactPercent?.toFixed(1)}%
-                </span>
-              </div>
-              <div className={`mt-2 p-2 rounded-lg text-[10px] font-medium ${
-                gcStressResult.verdict?.startsWith('PASS')
-                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                  : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
-              }`}>
-                {gcStressResult.verdict?.startsWith('PASS') ? (
-                  <CheckCircle2 className="w-3 h-3 inline mr-1" />
-                ) : (
-                  <AlertTriangle className="w-3 h-3 inline mr-1" />
-                )}
-                {gcStressResult.verdict}
-              </div>
+              {gcStressResult.error ? (
+                <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-300 text-xs flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>{gcStressResult.error}</span>
+                  </div>
+                  {clusterStatus?.role !== 'LEADER' && clusterStatus?.leaderId && (
+                    <button
+                      onClick={() => {
+                        const portMap: Record<string, string> = {
+                          'node-1': '',
+                          'node-2': 'http://localhost:8082/api',
+                          'node-3': 'http://localhost:8084/api',
+                        };
+                        const target = portMap[clusterStatus.leaderId as string];
+                        if (target !== undefined) setApiBaseUrl(target);
+                      }}
+                      className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 rounded-lg text-[10px] font-semibold tracking-wide transition-all"
+                    >
+                      Switch to Leader ({clusterStatus.leaderId})
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-white/30">Rolled Back</span>
+                    <span className="font-mono text-red-400">{gcStressResult.rolledBackCount ?? '—'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-white/30">GC Duration</span>
+                    <span className="font-mono text-white/60">
+                      {gcStressResult.gc?.gcDurationMs != null ? `${gcStressResult.gc.gcDurationMs.toFixed(2)}ms` : '—'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-white/30">Per-version GC</span>
+                    <span className="font-mono text-white/60">
+                      {gcStressResult.gc?.perVersionGcUs != null ? `${gcStressResult.gc.perVersionGcUs.toFixed(1)}μs` : '—'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-white/30">Throughput Impact</span>
+                    <span className={`font-mono font-semibold ${
+                      (gcStressResult.throughputComparison?.throughputImpactPercent ?? 0) < 5 ? 'text-emerald-400' : 'text-red-400'
+                    }`}>
+                      {gcStressResult.throughputComparison?.throughputImpactPercent != null
+                        ? `${gcStressResult.throughputComparison.throughputImpactPercent.toFixed(1)}%`
+                        : '—'}
+                    </span>
+                  </div>
+                  {gcStressResult.verdict && (
+                    <div className={`mt-2 p-2 rounded-lg text-[10px] font-medium ${
+                      gcStressResult.verdict.startsWith('PASS')
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                        : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                    }`}>
+                      {gcStressResult.verdict.startsWith('PASS') ? (
+                        <CheckCircle2 className="w-3 h-3 inline mr-1" />
+                      ) : (
+                        <AlertTriangle className="w-3 h-3 inline mr-1" />
+                      )}
+                      {gcStressResult.verdict}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
         </div>

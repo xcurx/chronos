@@ -48,7 +48,7 @@ export default function MetricsDashboard() {
     { label: 'Last Applied', value: clusterStatus?.lastApplied ?? 0, icon: CheckSquare, accent: 'text-amber-400', glow: 'bg-amber-500/10' },
     { label: 'Role', value: clusterStatus?.role ?? '—', icon: Shield, accent: 'text-purple-400', glow: 'bg-purple-500/10' },
     { label: 'Elections', value: metrics?.elections ?? 0, icon: Zap, accent: 'text-red-400', glow: 'bg-red-500/10' },
-    { label: 'Log Entries', value: metrics?.logEntries ?? 0, icon: ScrollText, accent: 'text-cyan-400', glow: 'bg-cyan-500/10' },
+    { label: 'Log Entries', value: metrics?.logEntries ?? metrics?.logSize ?? clusterStatus?.logSize ?? 0, icon: ScrollText, accent: 'text-cyan-400', glow: 'bg-cyan-500/10' },
   ];
 
   const gridStroke = 'rgba(255,255,255,0.04)';

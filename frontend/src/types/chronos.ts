@@ -1,17 +1,28 @@
-export type QueryMode = 'CURRENT' | 'AS_OF_VERSION' | 'AS_OF_TIME' | 'AS_OF_SNAPSHOT';
+export type QueryMode = 'CURRENT' | 'AS_OF_VERSION' | 'AS_OF_TIME' | 'AS_OF_SNAPSHOT' | 'AS_OF_VALID_TIME' | 'BITEMPORAL';
 export type ReadMode = 'LINEARIZABLE' | 'SPECULATIVE';
 export type BranchStatus = 'ACTIVE' | 'MERGED' | 'ABANDONED';
 export type ConflictType =
   | 'NONE'
   | 'COMPATIBLE_DELTA'
+  | 'COMPATIBLE_CRDT'
   | 'IDENTICAL_WRITE'
   | 'WRITE_WRITE'
+  | 'DELETE_MODIFY'
+  | 'MODIFY_DELETE'
   | 'UPDATE_DELETE'
   | 'DELETE_UPDATE'
   | 'CAUSAL_DIVERGENCE'
   | 'INVARIANT_VIOLATION';
 
-export type MergePolicy = 'COMMUTATIVE_DELTA' | 'LAST_WRITE_WINS' | 'FAIL_ON_CONFLICT' | 'CUSTOM_RESOLUTIONS';
+export type MergePolicy =
+  | 'CRDT'
+  | 'PN_COUNTER'
+  | 'OR_SET'
+  | 'LWW_REGISTER'
+  | 'COMMUTATIVE_DELTA'
+  | 'LAST_WRITE_WINS'
+  | 'FAIL_ON_CONFLICT'
+  | 'CUSTOM_RESOLUTIONS';
 
 export interface ChronosVersionSummary {
   versionId: string;
@@ -42,21 +53,57 @@ export interface TemporalQueryResult {
   value: string | null;
   found: boolean;
   versionId?: string;
+  versionSequence?: number;
   timestamp?: number;
   queryMode: QueryMode;
-  readMode: ReadMode;
+  readMode?: ReadMode;
   tombstone: boolean;
-  executionTimeMs: number;
+  executionTimeMs?: number;
+  latencyMs?: number;
+  validFrom?: number | null;
+  validTo?: number | null;
+}
+
+export interface StateDetailEntry {
+  key: string;
+  value: string;
+  versionId: string;
+  versionSequence: number;
+  timestamp: number;
+  branchId: string;
+  writerId: string;
+  transactionId?: string;
+  validFrom?: number | null;
+  validTo?: number | null;
 }
 
 export interface DatabaseStateResult {
   keys: Record<string, string>;
+  details?: StateDetailEntry[];
   totalKeys: number;
   asOfVersionId: string;
   asOfTimestamp: number;
   queryMode: QueryMode;
-  readMode: ReadMode;
+  readMode?: ReadMode;
   executionTimeMs: number;
+}
+
+export interface BitemporalTimelinePoint {
+  versionId: string;
+  sequence: number;
+  txnTime: number;
+  branchId: string;
+  writerId: string;
+  opType: 'PUT' | 'DELETE' | 'DELTA';
+  validFrom: number;
+  validTo: number | null;
+  value: string | null;
+}
+
+export interface BitemporalTimelineResponse {
+  key: string;
+  totalMutations: number;
+  timeline: BitemporalTimelinePoint[];
 }
 
 export interface KeyAuditEntry {

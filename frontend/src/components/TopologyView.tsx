@@ -47,6 +47,22 @@ export default function TopologyView() {
   const clusterStatus = useClusterStore((s) => s.clusterStatus);
   const nodes = useClusterStore((s) => s.nodes);
 
+  // Robust leader detection prioritizing ground-truth peer telemetry over local follower fallback
+  const detectLeaderId = useCallback((): string | undefined => {
+    const leaderFromNodes = nodes.find((n) => n.role === 'LEADER' || n.isLeader);
+    if (leaderFromNodes) return leaderFromNodes.id;
+
+    if (clusterStatus?.role === 'LEADER') return clusterStatus.nodeId;
+
+    if (clusterStatus?.leaderId) {
+      if (clusterStatus.role === 'FOLLOWER' && clusterStatus.leaderId === clusterStatus.nodeId) {
+        return undefined;
+      }
+      return clusterStatus.leaderId;
+    }
+    return undefined;
+  }, [nodes, clusterStatus]);
+
   // Determine all node IDs from both cluster status and nodes array
   const allNodeIds = useCallback((): string[] => {
     const ids = new Set<string>();
@@ -85,7 +101,8 @@ export default function TopologyView() {
         const isUp = found.isUp !== false;
         const isAlive = found.isAlive !== false;
         const isPartitioned = found.isPartitioned === true;
-        const role = (found.isLeader ? 'LEADER' : found.role) || (id === clusterStatus?.leaderId ? 'LEADER' : 'FOLLOWER');
+        const activeLeaderId = detectLeaderId();
+        const role = (found.isLeader || found.role === 'LEADER' || (activeLeaderId ? id === activeLeaderId : false)) ? 'LEADER' : 'FOLLOWER';
 
         let statusLabel: string = role;
         let statusColor: string = ROLE_COLORS[role] || ROLE_COLORS.FOLLOWER;
@@ -116,7 +133,8 @@ export default function TopologyView() {
       // Also check peerHealth from clusterStatus for peers not in nodes array
       const peerHealthAlive = clusterStatus?.peerHealth?.[id];
       const isPartitioned = clusterStatus?.partitionedPeers?.includes(id) ?? false;
-      const isLeader = id === clusterStatus?.leaderId;
+      const activeLeader = detectLeaderId();
+      const isLeader = activeLeader ? id === activeLeader : (id === clusterStatus?.leaderId);
       const role = isLeader ? 'LEADER' : 'FOLLOWER';
 
       if (peerHealthAlive === false) {
@@ -128,7 +146,7 @@ export default function TopologyView() {
 
       return { id, role, term: clusterStatus?.term, isUp: true, isAlive: true, isPartitioned: false, statusLabel: role, statusColor: ROLE_COLORS[role] || ROLE_COLORS.FOLLOWER };
     },
-    [nodes, clusterStatus],
+    [nodes, clusterStatus, detectLeaderId],
   );
 
   useEffect(() => {
@@ -175,10 +193,7 @@ export default function TopologyView() {
     if (rawNodeIds.length === 0) return;
 
     // Detect leader ID to place it at the top apex (angle -PI/2)
-    const leaderId =
-      clusterStatus?.leaderId ||
-      nodes.find((n) => n.role === 'LEADER' || n.isLeader)?.id ||
-      (clusterStatus?.role === 'LEADER' ? clusterStatus.nodeId : undefined);
+    const leaderId = detectLeaderId();
 
     const nodeIds = leaderId && rawNodeIds.includes(leaderId)
       ? [leaderId, ...rawNodeIds.filter((id) => id !== leaderId).sort()]
@@ -503,10 +518,7 @@ export default function TopologyView() {
   // Determine sorted node IDs for display cards (Leader first)
   const displayNodeIds = (() => {
     const rawIds = allNodeIds();
-    const leaderId =
-      clusterStatus?.leaderId ||
-      nodes.find((n) => n.role === 'LEADER' || n.isLeader)?.id ||
-      (clusterStatus?.role === 'LEADER' ? clusterStatus.nodeId : undefined);
+    const leaderId = detectLeaderId();
     return leaderId && rawIds.includes(leaderId)
       ? [leaderId, ...rawIds.filter((id) => id !== leaderId).sort()]
       : rawIds;
