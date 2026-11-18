@@ -312,37 +312,44 @@ All write endpoints automatically route to the active Raft leader.
 ### Key-Value & Consensus Endpoints
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/kv/{key}` | Fetch latest committed value for key |
-| `POST` | `/api/kv` | Raft-replicated put: `{"key": "k", "value": "v"}` |
-| `DELETE` | `/api/kv/{key}` | Append tombstone delete entry via Raft |
-| `GET` | `/api/kv/{key}/history` | Return all MVCC versions for a key |
-| `GET` | `/api/cluster/topology` | Return all nodes, roles, terms, and peers |
+| `POST` | `/api/kv/put` | Raft-replicated branch write: `{"key": "k", "value": "v", "branchId": "main"}` |
+| `POST` | `/api/kv/get` | Fetch committed value: `{"key": "k", "branchId": "main", "readMode": "LINEARIZABLE"}` |
+| `POST` | `/api/kv/delete` | Append tombstone delete: `{"key": "k", "branchId": "main"}` |
+| `POST` | `/api/kv/scan` | Scan range by prefix: `{"prefix": "k", "limit": 100, "branchId": "main"}` |
+| `POST` | `/api/kv/txn` | Atomic multi-op batch transaction: `{"operations": [...], "branchId": "main"}` |
+| `GET` | `/api/kv/versions/{key}` | Return all committed MVCC versions for a key |
+| `POST` | `/api/kv/speculative-put` | Speculative low-latency local put with pre-commit visibility |
+| `POST` | `/api/kv/speculative-delete`| Speculative low-latency deletion |
+| `GET` | `/api/cluster/status` | Cluster state, active Raft leader, node role, term, log index |
+| `GET` | `/api/nodes` | Health status and peer connectivity for all cluster nodes |
 
 ### Chronos Time-Travel & DAG Endpoints
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/chronos/dag` | Retrieve Version DAG topology (nodes, edges, branches) |
+| `GET` | `/api/chronos/dag` | Retrieve Version DAG topology (nodes, edges, branch heads) |
 | `GET` | `/api/chronos/branches` | List all active branches and their head versions |
 | `POST` | `/api/chronos/branches` | Create branch: `{"branchId": "b1", "baseVersionId": "V1"}` |
 | `POST` | `/api/chronos/write` | Write to branch with custom Valid-Time intervals |
-| `POST` | `/api/chronos/query` | As-of point-in-time query (`CURRENT`, `AS_OF_VERSION`, `AS_OF_TIME`) |
+| `GET` | `/api/chronos/query` | As-of point-in-time query (`CURRENT`, `AS_OF_VERSION`, `AS_OF_TIME`) |
 | `POST` | `/api/chronos/state` | Reconstruct entire database state as of version or time |
 | `GET` | `/api/chronos/diff` | Three-way diff between versions: `?v1=V1&v2=V2` |
 | `GET` | `/api/chronos/bitemporal/timeline/{key}` | Retrieve bitemporal transaction vs valid time intervals |
 | `GET` | `/api/chronos/audit/{key}` | Complete audit log with change deltas and author IDs |
 
-### Merge Studio Endpoints
+### Merge Studio & CRDT Endpoints
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/chronos/merge/preview` | Dry-run 3-way LCA merge: returns conflicts and LCA |
 | `POST` | `/api/chronos/merge` | Execute and commit merge using selected policy |
+| `GET` | `/api/chronos/crdt/types` | List registered CRDT types (`PN_COUNTER`, `OR_SET`, `LWW_REGISTER`) |
+| `GET` | `/api/chronos/invariants` | List active domain invariant rules |
+| `POST` | `/api/chronos/invariants` | Register a new invariant rule: `{"name": "...", "ruleType": "NON_NEGATIVE"}` |
 
 ### Retention, GC & Pinning Endpoints
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/chronos/retention` | Get low-watermark and retention configuration |
-| `POST` | `/api/chronos/pin` | Pin version against GC: `{"versionId": "V10"}` |
-| `POST` | `/api/chronos/unpin` | Release pinned version |
+| `PUT` | `/api/chronos/retention` | Update policy, window, max versions, or pin/unpin version |
 | `POST` | `/api/chronos/gc` | Trigger safe low-watermark garbage collection |
 
 ### Research Benchmark Endpoints
