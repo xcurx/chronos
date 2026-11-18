@@ -355,6 +355,7 @@ public class SpeculativeManager {
                 long totalLatencyNanos = System.nanoTime() - startNanos;
                 double totalLatencyMs = totalLatencyNanos / 1_000_000.0;
                 if (committed != null && committed) {
+                    recordStandardWrite(totalLatencyNanos);
                     return SpeculativeResult.committedViaSpeculative(timestamp, totalLatencyMs, logIndex, versionId);
                 } else {
                     return SpeculativeResult.failed("Raft commit failed after speculative write");
@@ -428,6 +429,17 @@ public class SpeculativeManager {
     public void setSpeculationEnabled(boolean enabled) {
         speculationEnabled.set(enabled);
         log.info("Speculation mode: {}", enabled ? "ENABLED" : "DISABLED");
+    }
+
+    /**
+     * Record a standard (non-speculative) write latency and increment the standard write count.
+     */
+    public void recordStandardWrite(long latencyNanos) {
+        if (latencyNanos <= 0) return;
+        standardWriteTimer.record(latencyNanos, TimeUnit.NANOSECONDS);
+        standardWriteCounter.increment();
+        standardWriteCount.incrementAndGet();
+        totalStandardLatencyNanos.addAndGet(latencyNanos);
     }
 
     // ================================================================

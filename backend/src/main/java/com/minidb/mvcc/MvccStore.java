@@ -67,6 +67,8 @@ public class MvccStore {
     private final AtomicLong totalCommitPromotions = new AtomicLong(0);
     private final AtomicLong totalRollbacks = new AtomicLong(0);
     private final AtomicLong totalStandardWrites = new AtomicLong(0);
+    private final AtomicLong totalGetOperations = new AtomicLong(0);
+    private final AtomicLong totalDeleteOperations = new AtomicLong(0);
 
     /**
      * Tracks a speculative version for commit promotion or rollback.
@@ -177,6 +179,7 @@ public class MvccStore {
         String mvccKeyStr = key + ":" + timestamp;
         speculativeVersions.put(mvccKeyStr, new SpeculativeEntry(key, timestamp, raftLogIndex, System.currentTimeMillis()));
         totalSpeculativeWrites.incrementAndGet();
+        totalDeleteOperations.incrementAndGet();
 
         log.debug("MVCC DELETE (speculative tombstone): key={}, ts={}, raftIdx={}", key, timestamp, raftLogIndex);
         return timestamp;
@@ -363,6 +366,7 @@ public class MvccStore {
      * and optionally subscribe for commit/rollback notifications.</p>
      */
     public MvccResult get(String key, long readTimestamp, ReadMode readMode) {
+        totalGetOperations.incrementAndGet();
         byte[] prefix = KeyEncoding.encodePrefix(key);
         byte[] upperBound = KeyEncoding.encodePrefixUpperBound(key);
 
@@ -403,6 +407,7 @@ public class MvccStore {
      * Delete a key at a specific timestamp (committed).
      */
     public long delete(String key, long timestamp) {
+        totalDeleteOperations.incrementAndGet();
         observeTimestamp(timestamp);
         byte[] mvccKey = KeyEncoding.encode(key, timestamp);
         byte[] encodedValue = KeyEncoding.encodeValue(TOMBSTONE_MARKER, VersionState.COMMITTED);
@@ -424,6 +429,7 @@ public class MvccStore {
      */
     public List<MvccResult> scan(String startKey, String endKey, int limit,
                                   long readTimestamp, ReadMode readMode) {
+        totalGetOperations.incrementAndGet();
         if (readTimestamp <= 0) readTimestamp = Long.MAX_VALUE;
 
         byte[] scanStart = KeyEncoding.encodePrefix(startKey);
@@ -652,6 +658,8 @@ public class MvccStore {
     public long getTotalRollbacks() { return totalRollbacks.get(); }
     public long getRollbackCount() { return totalRollbacks.get(); }
     public long getTotalStandardWrites() { return totalStandardWrites.get(); }
+    public long getTotalGetOperations() { return totalGetOperations.get(); }
+    public long getTotalDeleteOperations() { return totalDeleteOperations.get(); }
     public int getPendingSpeculativeCount() { return speculativeVersions.size(); }
     public Map<String, SpeculativeEntry> getPendingSpeculativeVersions() {
         return Collections.unmodifiableMap(speculativeVersions);

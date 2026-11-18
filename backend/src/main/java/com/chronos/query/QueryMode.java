@@ -7,6 +7,8 @@ public enum QueryMode {
     CURRENT,
     AS_OF_VERSION,
     AS_OF_TIME,
-    AS_OF_SNAPSHOT
+    AS_OF_SNAPSHOT,
+    AS_OF_VALID_TIME,
+    BITEMPORAL
 }
 

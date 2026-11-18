@@ -23,6 +23,20 @@ public final class ChangeEntry {
     private final OperationType opType;
     private final Long deltaAmount;
     private final String writerId;
+    private final Long validFrom;
+    private final Long validTo;
+
+    public ChangeEntry(
+            String key,
+            byte[] oldValue,
+            byte[] newValue,
+            boolean oldPresent,
+            boolean newPresent,
+            OperationType opType,
+            Long deltaAmount,
+            String writerId) {
+        this(key, oldValue, newValue, oldPresent, newPresent, opType, deltaAmount, writerId, null, null);
+    }
 
     @JsonCreator
     public ChangeEntry(
@@ -33,7 +47,9 @@ public final class ChangeEntry {
             @JsonProperty("newPresent") boolean newPresent,
             @JsonProperty("opType") OperationType opType,
             @JsonProperty("deltaAmount") Long deltaAmount,
-            @JsonProperty("writerId") String writerId) {
+            @JsonProperty("writerId") String writerId,
+            @JsonProperty("validFrom") Long validFrom,
+            @JsonProperty("validTo") Long validTo) {
         if (key == null || key.isBlank()) {
             throw new IllegalArgumentException("ChangeEntry key must be non-blank");
         }
@@ -45,20 +61,34 @@ public final class ChangeEntry {
         this.opType = Objects.requireNonNull(opType, "opType must not be null");
         this.deltaAmount = deltaAmount;
         this.writerId = writerId;
+        this.validFrom = validFrom;
+        this.validTo = validTo;
     }
 
     public static ChangeEntry put(String key, byte[] oldValue, byte[] newValue, String writerId) {
+        return put(key, oldValue, newValue, writerId, null, null);
+    }
+
+    public static ChangeEntry put(String key, byte[] oldValue, byte[] newValue, String writerId, Long validFrom, Long validTo) {
         Objects.requireNonNull(newValue, "PUT newValue must not be null");
-        return new ChangeEntry(key, oldValue, newValue, oldValue != null, true, OperationType.PUT, null, writerId);
+        return new ChangeEntry(key, oldValue, newValue, oldValue != null, true, OperationType.PUT, null, writerId, validFrom, validTo);
     }
 
     public static ChangeEntry delete(String key, byte[] oldValue, String writerId) {
-        return new ChangeEntry(key, oldValue, null, oldValue != null, false, OperationType.DELETE, null, writerId);
+        return delete(key, oldValue, writerId, null, null);
+    }
+
+    public static ChangeEntry delete(String key, byte[] oldValue, String writerId, Long validFrom, Long validTo) {
+        return new ChangeEntry(key, oldValue, null, oldValue != null, false, OperationType.DELETE, null, writerId, validFrom, validTo);
     }
 
     public static ChangeEntry delta(String key, byte[] oldValue, byte[] newValue, long deltaAmount, String writerId) {
+        return delta(key, oldValue, newValue, deltaAmount, writerId, null, null);
+    }
+
+    public static ChangeEntry delta(String key, byte[] oldValue, byte[] newValue, long deltaAmount, String writerId, Long validFrom, Long validTo) {
         Objects.requireNonNull(newValue, "DELTA newValue must not be null");
-        return new ChangeEntry(key, oldValue, newValue, oldValue != null, true, OperationType.DELTA, deltaAmount, writerId);
+        return new ChangeEntry(key, oldValue, newValue, oldValue != null, true, OperationType.DELTA, deltaAmount, writerId, validFrom, validTo);
     }
 
     public String getKey() {
@@ -93,6 +123,24 @@ public final class ChangeEntry {
         return writerId;
     }
 
+    public Long getValidFrom() {
+        return validFrom;
+    }
+
+    public Long getValidTo() {
+        return validTo;
+    }
+
+    /**
+     * Check if this change is effective at real-world valid time {@code targetValidTime}.
+     * An omitted {@code validFrom} defaults to {@code 0L}; an omitted {@code validTo} defaults to infinity.
+     */
+    public boolean isValidAt(long targetValidTime) {
+        long from = validFrom != null ? validFrom : 0L;
+        long to = validTo != null ? validTo : Long.MAX_VALUE;
+        return targetValidTime >= from && targetValidTime < to;
+    }
+
     @JsonIgnore
     public String getOldValueAsString() {
         return oldValue != null ? new String(oldValue, StandardCharsets.UTF_8) : null;
@@ -114,12 +162,14 @@ public final class ChangeEntry {
                 && Arrays.equals(newValue, that.newValue)
                 && opType == that.opType
                 && Objects.equals(deltaAmount, that.deltaAmount)
-                && Objects.equals(writerId, that.writerId);
+                && Objects.equals(writerId, that.writerId)
+                && Objects.equals(validFrom, that.validFrom)
+                && Objects.equals(validTo, that.validTo);
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(key, oldPresent, newPresent, opType, deltaAmount, writerId);
+        int result = Objects.hash(key, oldPresent, newPresent, opType, deltaAmount, writerId, validFrom, validTo);
         result = 31 * result + Arrays.hashCode(oldValue);
         result = 31 * result + Arrays.hashCode(newValue);
         return result;
@@ -129,7 +179,8 @@ public final class ChangeEntry {
     public String toString() {
         return "ChangeEntry{key='" + key + "', opType=" + opType
                 + ", oldPresent=" + oldPresent + ", newPresent=" + newPresent
-                + ", deltaAmount=" + deltaAmount + ", writerId='" + writerId + "'}";
+                + ", deltaAmount=" + deltaAmount + ", writerId='" + writerId + "'"
+                + ", validFrom=" + validFrom + ", validTo=" + validTo + "}";
     }
 }
 

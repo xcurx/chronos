@@ -28,7 +28,21 @@ public record DatabaseStateResult(
             long timestamp,
             String branchId,
             String writerId,
-            String transactionId
-    ) {}
+            String transactionId,
+            Long validFrom,
+            Long validTo
+    ) {
+        public StateEntry(
+                String key,
+                String value,
+                String versionId,
+                long versionSequence,
+                long timestamp,
+                String branchId,
+                String writerId,
+                String transactionId) {
+            this(key, value, versionId, versionSequence, timestamp, branchId, writerId, transactionId, null, null);
+        }
+    }
 }
 

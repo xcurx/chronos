@@ -29,6 +29,20 @@ public final class ChronosWritePayload {
     private final String mergePolicy;
     private final List<ConflictRecord> conflictMetadata;
     private final List<WriteOp> operations;
+    private final Long validFrom;
+    private final Long validTo;
+
+    public ChronosWritePayload(
+            String txnId,
+            String writerId,
+            String branchId,
+            List<String> parentVersionIds,
+            boolean isMerge,
+            String mergePolicy,
+            List<ConflictRecord> conflictMetadata,
+            List<WriteOp> operations) {
+        this(txnId, writerId, branchId, parentVersionIds, isMerge, mergePolicy, conflictMetadata, operations, null, null);
+    }
 
     @JsonCreator
     public ChronosWritePayload(
@@ -39,7 +53,9 @@ public final class ChronosWritePayload {
             @JsonProperty("isMerge") @JsonAlias("merge") boolean isMerge,
             @JsonProperty("mergePolicy") String mergePolicy,
             @JsonProperty("conflictMetadata") List<ConflictRecord> conflictMetadata,
-            @JsonProperty("operations") List<WriteOp> operations) {
+            @JsonProperty("operations") List<WriteOp> operations,
+            @JsonProperty("validFrom") Long validFrom,
+            @JsonProperty("validTo") Long validTo) {
         this.txnId = txnId;
         this.writerId = writerId;
         this.branchId = (branchId != null && !branchId.isBlank()) ? branchId : "main";
@@ -48,6 +64,8 @@ public final class ChronosWritePayload {
         this.mergePolicy = mergePolicy;
         this.conflictMetadata = conflictMetadata != null ? List.copyOf(conflictMetadata) : Collections.emptyList();
         this.operations = operations != null ? List.copyOf(operations) : Collections.emptyList();
+        this.validFrom = validFrom;
+        this.validTo = validTo;
     }
 
     public static Builder builder() {
@@ -65,6 +83,8 @@ public final class ChronosWritePayload {
     public String getMergePolicy() { return mergePolicy; }
     public List<ConflictRecord> getConflictMetadata() { return conflictMetadata; }
     public List<WriteOp> getOperations() { return operations; }
+    public Long getValidFrom() { return validFrom; }
+    public Long getValidTo() { return validTo; }
 
     public byte[] toJsonBytes() {
         try {
@@ -88,13 +108,25 @@ public final class ChronosWritePayload {
         private final byte[] value;
         private final OperationType opType;
         private final Long deltaAmount;
+        private final Long validFrom;
+        private final Long validTo;
+
+        public WriteOp(
+                String key,
+                byte[] value,
+                OperationType opType,
+                Long deltaAmount) {
+            this(key, value, opType, deltaAmount, null, null);
+        }
 
         @JsonCreator
         public WriteOp(
                 @JsonProperty("key") String key,
                 @JsonProperty("value") byte[] value,
                 @JsonProperty("opType") OperationType opType,
-                @JsonProperty("deltaAmount") Long deltaAmount) {
+                @JsonProperty("deltaAmount") Long deltaAmount,
+                @JsonProperty("validFrom") Long validFrom,
+                @JsonProperty("validTo") Long validTo) {
             if (key == null || key.isBlank()) {
                 throw new IllegalArgumentException("WriteOp key must be non-blank");
             }
@@ -102,26 +134,42 @@ public final class ChronosWritePayload {
             this.value = value != null ? value.clone() : null;
             this.opType = Objects.requireNonNull(opType, "opType must not be null");
             this.deltaAmount = deltaAmount;
+            this.validFrom = validFrom;
+            this.validTo = validTo;
         }
 
         public static WriteOp put(String key, byte[] value) {
+            return put(key, value, null, null);
+        }
+
+        public static WriteOp put(String key, byte[] value, Long validFrom, Long validTo) {
             Objects.requireNonNull(value, "PUT value must not be null");
-            return new WriteOp(key, value, OperationType.PUT, null);
+            return new WriteOp(key, value, OperationType.PUT, null, validFrom, validTo);
         }
 
         public static WriteOp delete(String key) {
-            return new WriteOp(key, null, OperationType.DELETE, null);
+            return delete(key, null, null);
+        }
+
+        public static WriteOp delete(String key, Long validFrom, Long validTo) {
+            return new WriteOp(key, null, OperationType.DELETE, null, validFrom, validTo);
         }
 
         public static WriteOp delta(String key, byte[] resolvedValue, long deltaAmount) {
+            return delta(key, resolvedValue, deltaAmount, null, null);
+        }
+
+        public static WriteOp delta(String key, byte[] resolvedValue, long deltaAmount, Long validFrom, Long validTo) {
             Objects.requireNonNull(resolvedValue, "DELTA value must not be null");
-            return new WriteOp(key, resolvedValue, OperationType.DELTA, deltaAmount);
+            return new WriteOp(key, resolvedValue, OperationType.DELTA, deltaAmount, validFrom, validTo);
         }
 
         public String getKey() { return key; }
         public byte[] getValue() { return value != null ? value.clone() : null; }
         public OperationType getOpType() { return opType; }
         public Long getDeltaAmount() { return deltaAmount; }
+        public Long getValidFrom() { return validFrom; }
+        public Long getValidTo() { return validTo; }
 
         @Override
         public boolean equals(Object o) {
@@ -130,12 +178,14 @@ public final class ChronosWritePayload {
             return Objects.equals(key, writeOp.key)
                     && Arrays.equals(value, writeOp.value)
                     && opType == writeOp.opType
-                    && Objects.equals(deltaAmount, writeOp.deltaAmount);
+                    && Objects.equals(deltaAmount, writeOp.deltaAmount)
+                    && Objects.equals(validFrom, writeOp.validFrom)
+                    && Objects.equals(validTo, writeOp.validTo);
         }
 
         @Override
         public int hashCode() {
-            int result = Objects.hash(key, opType, deltaAmount);
+            int result = Objects.hash(key, opType, deltaAmount, validFrom, validTo);
             result = 31 * result + Arrays.hashCode(value);
             return result;
         }
@@ -150,6 +200,8 @@ public final class ChronosWritePayload {
         private String mergePolicy;
         private List<ConflictRecord> conflictMetadata = Collections.emptyList();
         private List<WriteOp> operations = Collections.emptyList();
+        private Long validFrom;
+        private Long validTo;
 
         public Builder txnId(String txnId) { this.txnId = txnId; return this; }
         public Builder writerId(String writerId) { this.writerId = writerId; return this; }
@@ -159,10 +211,12 @@ public final class ChronosWritePayload {
         public Builder mergePolicy(String mergePolicy) { this.mergePolicy = mergePolicy; return this; }
         public Builder conflictMetadata(List<ConflictRecord> conflictMetadata) { this.conflictMetadata = conflictMetadata; return this; }
         public Builder operations(List<WriteOp> operations) { this.operations = operations; return this; }
+        public Builder validFrom(Long validFrom) { this.validFrom = validFrom; return this; }
+        public Builder validTo(Long validTo) { this.validTo = validTo; return this; }
 
         public ChronosWritePayload build() {
             return new ChronosWritePayload(txnId, writerId, branchId, parentVersionIds,
-                    isMerge, mergePolicy, conflictMetadata, operations);
+                    isMerge, mergePolicy, conflictMetadata, operations, validFrom, validTo);
         }
     }
 }

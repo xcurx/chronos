@@ -94,11 +94,19 @@ public class TemporalQueryService {
 
             AncestorWalkResult walk = collectOrderedAncestors(target);
             List<ChronosVersion> ancestorsAsc = walk.ancestors();
+
+            Long targetVt = (effectiveMode == QueryMode.AS_OF_VALID_TIME || effectiveMode == QueryMode.BITEMPORAL)
+                    ? parseTimestamp(request.validTime() != null ? request.validTime() : String.valueOf(System.currentTimeMillis()))
+                    : null;
+
             // Walk backwards from target towards root so we stop at the most recent causal touch of key.
             for (int i = ancestorsAsc.size() - 1; i >= 0; i--) {
                 ChronosVersion v = ancestorsAsc.get(i);
                 ChangeEntry match = findLastChangeForKey(v, request.key());
                 if (match == null) {
+                    continue;
+                }
+                if (targetVt != null && !match.isValidAt(targetVt)) {
                     continue;
                 }
                 long latency = System.currentTimeMillis() - start;
@@ -113,7 +121,9 @@ public class TemporalQueryService {
                             v.getWriterId(),
                             v.getTransactionId(),
                             effectiveMode,
-                            latency
+                            latency,
+                            match.getValidFrom(),
+                            match.getValidTo()
                     );
                 }
                 return TemporalQueryResult.ofFound(
@@ -127,7 +137,9 @@ public class TemporalQueryService {
                         match.getWriterId() != null ? match.getWriterId() : v.getWriterId(),
                         v.getTransactionId(),
                         effectiveMode,
-                        latency
+                        latency,
+                        match.getValidFrom(),
+                        match.getValidTo()
                 );
             }
 
@@ -174,7 +186,11 @@ public class TemporalQueryService {
             }
             lease.updateBounds(target.getSequence(), target.getTimestamp());
 
-            Map<String, DatabaseStateResult.StateEntry> state = buildCausalStateMap(target);
+            Long targetVt = (effectiveMode == QueryMode.AS_OF_VALID_TIME || effectiveMode == QueryMode.BITEMPORAL)
+                    ? parseTimestamp(effectiveReq.validTime() != null ? effectiveReq.validTime() : String.valueOf(System.currentTimeMillis()))
+                    : null;
+
+            Map<String, DatabaseStateResult.StateEntry> state = buildCausalStateMap(target, targetVt);
             return toDatabaseStateResult(target, effectiveMode, state, effectiveReq.prefix(), effectiveReq.limit(), start);
         }
     }
@@ -266,6 +282,13 @@ public class TemporalQueryService {
         if (req.mode() != null) {
             return req.mode();
         }
+        if (req.validTime() != null && !req.validTime().isBlank()) {
+            if ((req.timestamp() != null && !req.timestamp().isBlank())
+                    || (req.versionId() != null && !req.versionId().isBlank())) {
+                return QueryMode.BITEMPORAL;
+            }
+            return QueryMode.AS_OF_VALID_TIME;
+        }
         if (req.versionId() != null && !req.versionId().isBlank()) {
             return QueryMode.AS_OF_VERSION;
         }
@@ -293,7 +316,7 @@ public class TemporalQueryService {
         boolean hasPurged = watermark != null && watermark.getLastPurgedAt() > 0;
 
         return switch (mode) {
-            case CURRENT -> resolveCurrentVersion(effectiveBranch, readMode == ReadMode.SPECULATIVE);
+            case CURRENT, AS_OF_VALID_TIME -> resolveCurrentVersion(effectiveBranch, readMode == ReadMode.SPECULATIVE);
             case AS_OF_VERSION -> resolveVersionById(req.versionId(), watermark, hasPurged);
             case AS_OF_TIME -> {
                 long targetTs = parseTimestamp(req.timestamp());
@@ -309,6 +332,16 @@ public class TemporalQueryService {
                 }
                 yield versionCatalog.findVersionAtOrBeforeTimestamp(targetTs, effectiveBranch, false)
                         .orElse(null);
+            }
+            case BITEMPORAL -> {
+                if (req.versionId() != null && !req.versionId().isBlank()) {
+                    yield resolveVersionById(req.versionId(), watermark, hasPurged, QueryMode.BITEMPORAL.name(), req.versionId());
+                } else if (req.timestamp() != null && !req.timestamp().isBlank()) {
+                    long targetTs = parseTimestamp(req.timestamp());
+                    yield versionCatalog.findVersionAtOrBeforeTimestamp(targetTs, effectiveBranch, false).orElse(null);
+                } else {
+                    yield resolveCurrentVersion(effectiveBranch, readMode == ReadMode.SPECULATIVE);
+                }
             }
             case AS_OF_SNAPSHOT -> {
                 if (req.snapshotId() == null || req.snapshotId().isBlank()) {
@@ -412,12 +445,21 @@ public class TemporalQueryService {
 
     private ReadWatermarkRegistry.ReadLease acquireInitialLease(TemporalQueryRequest req, QueryMode mode) {
         return switch (mode) {
-            case CURRENT -> watermarkRegistry.acquirePin(Long.MAX_VALUE, Long.MAX_VALUE);
+            case CURRENT, AS_OF_VALID_TIME -> watermarkRegistry.acquirePin(Long.MAX_VALUE, Long.MAX_VALUE);
             case AS_OF_TIME -> {
                 long ts = (req.timestamp() != null && !req.timestamp().isBlank())
                         ? parseTimestamp(req.timestamp())
                         : Long.MAX_VALUE;
                 yield watermarkRegistry.acquirePin(Long.MAX_VALUE, ts);
+            }
+            case BITEMPORAL -> {
+                long ts = (req.timestamp() != null && !req.timestamp().isBlank())
+                        ? parseTimestamp(req.timestamp())
+                        : Long.MAX_VALUE;
+                long seq = (req.versionId() != null && !req.versionId().isBlank())
+                        ? tryParseVersionSequence(req.versionId()).orElse(0L)
+                        : 0L;
+                yield watermarkRegistry.acquirePin(seq, ts);
             }
             case AS_OF_VERSION -> {
                 long seq = (req.versionId() != null && !req.versionId().isBlank())
@@ -461,6 +503,10 @@ public class TemporalQueryService {
     }
 
     private Map<String, DatabaseStateResult.StateEntry> buildCausalStateMap(ChronosVersion target) {
+        return buildCausalStateMap(target, null);
+    }
+
+    private Map<String, DatabaseStateResult.StateEntry> buildCausalStateMap(ChronosVersion target, Long targetValidTime) {
         AncestorWalkResult walk = collectOrderedAncestors(target);
         List<ChronosVersion> ancestorsAsc = walk.ancestors();
         Map<String, DatabaseStateResult.StateEntry> state = new TreeMap<>();
@@ -494,6 +540,9 @@ public class TemporalQueryService {
                 if (entry.getKey() == null) {
                     continue;
                 }
+                if (targetValidTime != null && !entry.isValidAt(targetValidTime)) {
+                    continue;
+                }
                 if (entry.getOpType() == OperationType.DELETE || !entry.isNewPresent() || entry.getNewValue() == null) {
                     state.remove(entry.getKey());
                 } else {
@@ -507,12 +556,46 @@ public class TemporalQueryService {
                             v.getTimestamp(),
                             v.getBranchId(),
                             writer,
-                            v.getTransactionId()
+                            v.getTransactionId(),
+                            entry.getValidFrom(),
+                            entry.getValidTo()
                     ));
                 }
             }
         }
         return state;
+    }
+
+    /**
+     * Return the complete 2D bitemporal mutation history of a key.
+     */
+    public List<Map<String, Object>> getKeyBitemporalTimeline(String key) {
+        if (key == null || key.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<ChronosVersion> versions = versionCatalog.findVersionsByKeyBitemporal(key);
+        if (versions.isEmpty()) {
+            versions = versionCatalog.listVersions(0);
+        }
+        List<Map<String, Object>> timeline = new ArrayList<>();
+        for (ChronosVersion v : versions) {
+            for (ChangeEntry c : v.getChangeSet()) {
+                if (key.equals(c.getKey())) {
+                    Map<String, Object> point = new LinkedHashMap<>();
+                    point.put("versionId", v.getVersionId());
+                    point.put("sequence", v.getSequence());
+                    point.put("txnTime", v.getTimestamp());
+                    point.put("branchId", v.getBranchId());
+                    point.put("writerId", c.getWriterId() != null ? c.getWriterId() : v.getWriterId());
+                    point.put("opType", c.getOpType().name());
+                    point.put("validFrom", c.getValidFrom() != null ? c.getValidFrom() : v.getTimestamp());
+                    point.put("validTo", c.getValidTo());
+                    point.put("value", c.getNewValueAsString());
+                    timeline.add(point);
+                }
+            }
+        }
+        return timeline;
     }
 
     private ChangeEntry findLastChangeForKey(ChronosVersion v, String key) {

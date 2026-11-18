@@ -1,6 +1,7 @@
 package com.chronos.storage;
 
 import com.chronos.model.CatalogWatermark;
+import com.chronos.model.ChangeEntry;
 import com.chronos.model.ChronosSnapshot;
 import com.chronos.model.ChronosVersion;
 import com.chronos.model.VersionStatus;
@@ -32,6 +33,7 @@ public class VersionCatalog {
     private final Object writeLock = new Object();
     private final AtomicLong sequenceCounter = new AtomicLong(0);
     private final List<Supplier<Set<String>>> protectedVersionSuppliers = new CopyOnWriteArrayList<>();
+    private final Map<String, ChronosVersion> versionCache = new java.util.concurrent.ConcurrentHashMap<>(8192);
 
     public VersionCatalog(StorageEngine storage) {
         this.storage = Objects.requireNonNull(storage, "storage must not be null");
@@ -72,6 +74,7 @@ public class VersionCatalog {
      */
     public void reloadFromStorage() {
         synchronized (writeLock) {
+            versionCache.clear();
             sequenceCounter.set(0);
             initializeSequenceCounter();
         }
@@ -234,6 +237,17 @@ public class VersionCatalog {
                 ChronosKeys.timeKey(version.getTimestamp(), version.getSequence(), version.getVersionId()),
                 versionIdBytes));
 
+        // Index each change entry in the 2D bitemporal range index
+        for (ChangeEntry change : version.getChangeSet()) {
+            if (change.getKey() != null) {
+                long vf = change.getValidFrom() != null ? change.getValidFrom() : version.getTimestamp();
+                long vt = change.getValidTo() != null ? change.getValidTo() : Long.MAX_VALUE;
+                batch.add(Map.entry(
+                        ChronosKeys.bitempKey(change.getKey(), vf, vt, version.getSequence()),
+                        versionIdBytes));
+            }
+        }
+
         if (version.getSequence() > sequenceCounter.get()) {
             batch.add(Map.entry(ChronosKeys.LAST_SEQ_KEY_BYTES,
                     ChronosKeys.utf8(Long.toString(version.getSequence()))));
@@ -258,6 +272,7 @@ public class VersionCatalog {
         }
 
         storage.writeBatch(batch);
+        versionCache.put(version.getVersionId(), version);
         sequenceCounter.accumulateAndGet(version.getSequence(), Math::max);
     }
 
@@ -335,11 +350,17 @@ public class VersionCatalog {
         if (versionId == null || versionId.isBlank()) {
             return Optional.empty();
         }
+        ChronosVersion cached = versionCache.get(versionId);
+        if (cached != null) {
+            return Optional.of(cached);
+        }
         byte[] data = storage.get(ChronosKeys.versionKey(versionId));
         if (data == null) {
             return Optional.empty();
         }
-        return Optional.of(deserialize(data, ChronosVersion.class));
+        ChronosVersion deserialized = deserialize(data, ChronosVersion.class);
+        versionCache.put(versionId, deserialized);
+        return Optional.of(deserialized);
     }
 
     public Optional<ChronosVersion> getVersionBySequence(long sequence) {
@@ -489,6 +510,29 @@ public class VersionCatalog {
     }
 
     /**
+     * Scan the 2D bitemporal index for a specific key, returning all matching version nodes ordered by sequence.
+     */
+    public List<ChronosVersion> findVersionsByKeyBitemporal(String key) {
+        if (key == null || key.isBlank()) {
+            return Collections.emptyList();
+        }
+        byte[] startKey = ChronosKeys.bitempPrefixForKey(key);
+        byte[] endKey = ChronosKeys.bitempEndForKey(key);
+        List<Map.Entry<byte[], byte[]>> entries = storage.scan(startKey, endKey, 0);
+
+        List<ChronosVersion> result = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Map.Entry<byte[], byte[]> e : entries) {
+            String verId = new String(e.getValue(), StandardCharsets.UTF_8);
+            if (seen.add(verId)) {
+                getVersion(verId).ifPresent(result::add);
+            }
+        }
+        result.sort(Comparator.comparingLong(ChronosVersion::getSequence));
+        return result;
+    }
+
+    /**
      * List all branch heads currently tracked in the catalog.
      */
     public Map<String, String> listBranchHeads() {
@@ -597,6 +641,7 @@ public class VersionCatalog {
 
             List<Map.Entry<byte[], byte[]>> deleteBatch = new ArrayList<>(versionsToPurge.size() * 3);
             for (ChronosVersion v : versionsToPurge) {
+                versionCache.remove(v.getVersionId());
                 deleteBatch.add(new AbstractMap.SimpleEntry<>(ChronosKeys.versionKey(v.getVersionId()), null));
                 deleteBatch.add(new AbstractMap.SimpleEntry<>(ChronosKeys.seqKey(v.getSequence()), null));
                 deleteBatch.add(new AbstractMap.SimpleEntry<>(

@@ -1,5 +1,7 @@
 package com.chronos.merge;
 
+import com.chronos.crdt.CrdtMergeResolver;
+import com.chronos.crdt.CrdtResolutionResult;
 import com.chronos.dag.AggregatedKeyDiff;
 import com.chronos.dag.AggregatedPathDiff;
 import com.chronos.dag.VersionDagService;
@@ -10,6 +12,7 @@ import com.chronos.query.TemporalQueryService;
 import com.chronos.storage.VersionCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -25,13 +28,23 @@ public class ConflictDetector {
     private final VersionCatalog versionCatalog;
     private final VersionDagService versionDagService;
     private final TemporalQueryService temporalQueryService;
+    private final CrdtMergeResolver crdtMergeResolver;
 
     public ConflictDetector(VersionCatalog versionCatalog,
                             VersionDagService versionDagService,
                             TemporalQueryService temporalQueryService) {
+        this(versionCatalog, versionDagService, temporalQueryService, new CrdtMergeResolver());
+    }
+
+    @Autowired
+    public ConflictDetector(VersionCatalog versionCatalog,
+                            VersionDagService versionDagService,
+                            TemporalQueryService temporalQueryService,
+                            @Autowired(required = false) CrdtMergeResolver crdtMergeResolver) {
         this.versionCatalog = versionCatalog;
         this.versionDagService = versionDagService;
         this.temporalQueryService = temporalQueryService;
+        this.crdtMergeResolver = crdtMergeResolver != null ? crdtMergeResolver : new CrdtMergeResolver();
     }
 
     /**
@@ -185,19 +198,51 @@ public class ConflictDetector {
                     ));
                     hasUnresolvable = true;
                 } else {
-                    // WRITE_WRITE: both wrote different non-null values
-                    conflicts.add(new DetectedConflict(
-                            key,
-                            ConflictType.WRITE_WRITE,
-                            branchAId,
-                            branchBId,
-                            baseVal,
-                            valA,
-                            valB,
-                            "Concurrent write on both branches with different values: '" + valA + "' vs '" + valB + "'",
-                            false
-                    ));
-                    hasUnresolvable = true;
+                    // Both wrote different non-null values: check if key or payload qualifies for automatic CRDT resolution
+                    if (crdtMergeResolver != null && crdtMergeResolver.canResolveAsCrdt(key, baseVal, valA, valB, null)) {
+                        ChronosVersion tipAVer = versionCatalog.getVersion(branchATipId).orElse(null);
+                        ChronosVersion tipBVer = versionCatalog.getVersion(branchBTipId).orElse(null);
+                        long tsA = tipAVer != null ? tipAVer.getTimestamp() : 0L;
+                        long tsB = tipBVer != null ? tipBVer.getTimestamp() : 0L;
+                        long seqA = tipAVer != null ? tipAVer.getSequence() : 0L;
+                        long seqB = tipBVer != null ? tipBVer.getSequence() : 0L;
+                        String writerA = tipAVer != null ? tipAVer.getWriterId() : branchAId;
+                        String writerB = tipBVer != null ? tipBVer.getWriterId() : branchBId;
+
+                        CrdtResolutionResult cr = crdtMergeResolver.resolve(
+                                key, baseVal, valA, valB,
+                                branchAId, branchBId,
+                                tsA, tsB, seqA, seqB,
+                                writerA, writerB,
+                                null
+                        );
+                        tentativeMergedState.put(key, cr.resolvedValue());
+                        conflicts.add(new DetectedConflict(
+                                key,
+                                ConflictType.COMPATIBLE_CRDT,
+                                branchAId,
+                                branchBId,
+                                baseVal,
+                                valA,
+                                valB,
+                                "Compatible CRDT (" + cr.crdtType() + "): " + cr.explanation(),
+                                true
+                        ));
+                    } else {
+                        // WRITE_WRITE: both wrote different non-null values
+                        conflicts.add(new DetectedConflict(
+                                key,
+                                ConflictType.WRITE_WRITE,
+                                branchAId,
+                                branchBId,
+                                baseVal,
+                                valA,
+                                valB,
+                                "Concurrent write on both branches with different values: '" + valA + "' vs '" + valB + "'",
+                                false
+                        ));
+                        hasUnresolvable = true;
+                    }
                 }
             }
         }

@@ -3,6 +3,8 @@ package com.chronos.merge;
 import com.chronos.branch.BranchInfo;
 import com.chronos.branch.BranchManager;
 import com.chronos.branch.BranchStatus;
+import com.chronos.crdt.CrdtMergeResolver;
+import com.chronos.crdt.CrdtResolutionResult;
 import com.chronos.model.ChronosVersion;
 import com.chronos.storage.VersionCatalog;
 import com.chronos.dag.VersionDagService;
@@ -26,7 +28,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * High-performance deterministic branch merge engine for Chronos.
- * Evaluates three-way merge previews, resolves conflicts commutatively or via LWW/custom,
+ * Evaluates three-way merge previews, resolves conflicts commutatively, via CRDTs, or via LWW/custom,
  * enforces domain safety invariants, and commits two-parent DAG merge nodes via Raft consensus.
  */
 @Service
@@ -43,6 +45,7 @@ public class MergeEngine {
     private final RaftNode raftNode;
     private final EventBus eventBus;
     private final ChronosMetrics chronosMetrics;
+    private final CrdtMergeResolver crdtMergeResolver;
 
     public MergeEngine(
             VersionCatalog versionCatalog,
@@ -53,7 +56,21 @@ public class MergeEngine {
             InvariantValidator invariantValidator,
             RaftNode raftNode) {
         this(versionCatalog, branchManager, versionDagService, temporalQueryService,
-             conflictDetector, invariantValidator, raftNode, null, null);
+             conflictDetector, invariantValidator, raftNode, null, null, null);
+    }
+
+    public MergeEngine(
+            VersionCatalog versionCatalog,
+            BranchManager branchManager,
+            VersionDagService versionDagService,
+            TemporalQueryService temporalQueryService,
+            ConflictDetector conflictDetector,
+            InvariantValidator invariantValidator,
+            RaftNode raftNode,
+            EventBus eventBus,
+            ChronosMetrics chronosMetrics) {
+        this(versionCatalog, branchManager, versionDagService, temporalQueryService,
+             conflictDetector, invariantValidator, raftNode, eventBus, chronosMetrics, null);
     }
 
     @Autowired
@@ -66,7 +83,8 @@ public class MergeEngine {
             InvariantValidator invariantValidator,
             RaftNode raftNode,
             @Autowired(required = false) EventBus eventBus,
-            @Autowired(required = false) ChronosMetrics chronosMetrics) {
+            @Autowired(required = false) ChronosMetrics chronosMetrics,
+            @Autowired(required = false) CrdtMergeResolver crdtMergeResolver) {
         this.versionCatalog = versionCatalog;
         this.branchManager = branchManager;
         this.versionDagService = versionDagService;
@@ -76,6 +94,7 @@ public class MergeEngine {
         this.raftNode = raftNode;
         this.eventBus = eventBus;
         this.chronosMetrics = chronosMetrics;
+        this.crdtMergeResolver = crdtMergeResolver != null ? crdtMergeResolver : new CrdtMergeResolver();
     }
 
     /**
@@ -368,6 +387,49 @@ public class MergeEngine {
                 resolvedBytes = leftBytes;
                 strategy = "IDENTICAL";
                 winningWriter = "identical";
+            } else if (c.conflictType() == ConflictType.COMPATIBLE_CRDT) {
+                if (req.policy() == MergePolicy.FAIL_ON_CONFLICT) {
+                    canMerge = false;
+                    rejectionReason = "Conflict detected on key '" + k + "' under FAIL_ON_CONFLICT policy";
+                    break;
+                }
+                String crdtVal = tentativeState.get(k);
+                if (crdtVal == null) {
+                    crdtVal = detection.nonConflictingMergedState().get(k);
+                }
+                tentativeState.put(k, crdtVal);
+                resolutions.put(k, crdtVal);
+                resolvedBytes = crdtVal != null ? crdtVal.getBytes(StandardCharsets.UTF_8) : null;
+                strategy = "CRDT_AUTO";
+                winningWriter = "crdt-engine";
+            } else if (isCrdtPolicy(req.policy())
+                    || (crdtMergeResolver != null && crdtMergeResolver.canResolveAsCrdt(k, c.baseValue(), leftVal, rightVal, req.policy()))) {
+                if (req.policy() == MergePolicy.FAIL_ON_CONFLICT) {
+                    canMerge = false;
+                    rejectionReason = "Conflict detected on key '" + k + "' under FAIL_ON_CONFLICT policy";
+                    break;
+                }
+                ChronosVersion targetTip = versionCatalog.getVersion(targetTipId).orElse(null);
+                ChronosVersion sourceTip = versionCatalog.getVersion(sourceTipId).orElse(null);
+                long tsA = targetTip != null ? targetTip.getTimestamp() : 0L;
+                long tsB = sourceTip != null ? sourceTip.getTimestamp() : 0L;
+                long seqA = targetTip != null ? targetTip.getSequence() : 0L;
+                long seqB = sourceTip != null ? sourceTip.getSequence() : 0L;
+                String writerA = targetTip != null ? targetTip.getWriterId() : req.targetBranch();
+                String writerB = sourceTip != null ? sourceTip.getWriterId() : req.sourceBranch();
+
+                CrdtResolutionResult cr = crdtMergeResolver.resolve(
+                        k, c.baseValue(), leftVal, rightVal,
+                        req.targetBranch(), req.sourceBranch(),
+                        tsA, tsB, seqA, seqB,
+                        writerA, writerB,
+                        req.policy()
+                );
+                tentativeState.put(k, cr.resolvedValue());
+                resolutions.put(k, cr.resolvedValue());
+                resolvedBytes = cr.resolvedValue() != null ? cr.resolvedValue().getBytes(StandardCharsets.UTF_8) : null;
+                strategy = cr.strategy();
+                winningWriter = cr.winningWriter();
             } else if (req.policy() == MergePolicy.COMMUTATIVE_DELTA
                     && c.baseValue() != null
                     && isNumeric(c.baseValue())
@@ -489,6 +551,13 @@ public class MergeEngine {
         } catch (NumberFormatException e) {
             return def;
         }
+    }
+
+    private boolean isCrdtPolicy(MergePolicy policy) {
+        return policy == MergePolicy.CRDT
+                || policy == MergePolicy.PN_COUNTER
+                || policy == MergePolicy.OR_SET
+                || policy == MergePolicy.LWW_REGISTER;
     }
 
     private record EvaluationResult(

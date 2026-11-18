@@ -9,6 +9,8 @@ import com.chronos.branch.BranchStatus;
 import com.chronos.dag.AggregatedPathDiff;
 import com.chronos.dag.VersionDagResponse;
 import com.chronos.dag.VersionDagService;
+import com.chronos.crdt.CrdtMergeResolver;
+import com.chronos.crdt.CrdtResolutionResult;
 import com.chronos.gc.ChronosGcService;
 import com.chronos.gc.ChronosRetentionConfig;
 import com.chronos.gc.ReadWatermarkRegistry;
@@ -102,6 +104,7 @@ public class ChronosController {
     private final InvariantRegistry invariantRegistry;
     private final ChronosMetrics chronosMetrics;
     private final HttpClient httpClient;
+    private final CrdtMergeResolver crdtMergeResolver = new CrdtMergeResolver();
 
     public ChronosController(RaftNode raftNode,
                              RaftConfig raftConfig,
@@ -294,12 +297,17 @@ public class ChronosController {
             parents = Collections.emptyList();
         }
 
+        Long payloadValidFrom = parseOptionalTimestamp(request.get("validFrom"));
+        Long payloadValidTo = parseOptionalTimestamp(request.get("validTo"));
+
         ChronosWritePayload payload = ChronosWritePayload.builder()
                 .txnId(txnId)
                 .writerId(writerId)
                 .branchId(branchId)
                 .parentVersionIds(parents)
                 .operations(ops)
+                .validFrom(payloadValidFrom)
+                .validTo(payloadValidTo)
                 .build();
 
         RaftLog.CommandType cmdType;
@@ -316,6 +324,9 @@ public class ChronosController {
             RaftNode.ChronosWriteResult writeResult = raftNode.submitChronosWrite(cmdType, payload)
                     .get(10, TimeUnit.SECONDS);
             long latency = System.currentTimeMillis() - start;
+            if (speculativeManager != null && writeResult != null && writeResult.committed()) {
+                speculativeManager.recordStandardWrite(TimeUnit.MILLISECONDS.toNanos(latency));
+            }
 
             resp.put("success", writeResult != null && writeResult.committed());
             resp.put("speculative", false);
@@ -349,7 +360,7 @@ public class ChronosController {
     }
 
     /**
-     * Temporal single-key query: CURRENT, AS_OF_VERSION, AS_OF_TIME, or AS_OF_SNAPSHOT.
+     * Temporal single-key query: CURRENT, AS_OF_VERSION, AS_OF_TIME, AS_OF_SNAPSHOT, AS_OF_VALID_TIME, or BITEMPORAL.
      */
     @GetMapping("/query")
     public Map<String, Object> query(
@@ -359,20 +370,29 @@ public class ChronosController {
             @RequestParam(required = false) String timestamp,
             @RequestParam(required = false) String snapshotId,
             @RequestParam(required = false) String branchId,
+            @RequestParam(required = false) String validTime,
+            @RequestParam(required = false) String asOfValidTime,
+            @RequestParam(required = false) String asOfTxnTime,
             @RequestParam(defaultValue = "LINEARIZABLE") String readMode,
             @RequestParam(defaultValue = "false") boolean consistent) {
+
+        String effectiveVt = (asOfValidTime != null && !asOfValidTime.isBlank()) ? asOfValidTime : validTime;
+        String effectiveTt = (asOfTxnTime != null && !asOfTxnTime.isBlank()) ? asOfTxnTime : timestamp;
 
         TemporalQueryRequest request = new TemporalQueryRequest(
                 parseQueryMode(mode),
                 key,
                 versionId,
-                timestamp,
+                effectiveTt,
                 snapshotId,
                 branchId,
                 parseReadMode(readMode),
                 consistent,
                 null,
-                0
+                0,
+                effectiveVt,
+                null,
+                null
         );
 
         TemporalQueryResult result = temporalQueryService.queryKey(request);
@@ -388,13 +408,34 @@ public class ChronosController {
         resp.put("branchId", result.branchId());
         resp.put("writerId", result.writerId());
         resp.put("transactionId", result.transactionId());
+        resp.put("validFrom", result.validFrom());
+        resp.put("validTo", result.validTo());
         resp.put("queryMode", result.queryMode() != null ? result.queryMode().name() : null);
         resp.put("latencyMs", result.latencyMs());
+        if (eventBus != null) {
+            eventBus.publish(com.minidb.events.ClusterEvent.kvOperation("GET", key, result.latencyMs(), result.found()));
+        }
         return resp;
     }
 
     /**
-     * Full database state reconstruction at any historical version, timestamp, or snapshot.
+     * Retrieve the complete 2D bitemporal history matrix for a specific key.
+     */
+    @GetMapping("/bitemporal/timeline/{key}")
+    public Map<String, Object> getKeyBitemporalTimeline(@PathVariable String key) {
+        if (temporalQueryService == null) {
+            throw new IllegalStateException("TemporalQueryService unavailable");
+        }
+        List<Map<String, Object>> timeline = temporalQueryService.getKeyBitemporalTimeline(key);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("key", key);
+        resp.put("totalMutations", timeline.size());
+        resp.put("timeline", timeline);
+        return resp;
+    }
+
+    /**
+     * Full database state reconstruction at any historical version, timestamp, snapshot, or valid time.
      */
     @GetMapping("/state")
     public Map<String, Object> state(
@@ -404,10 +445,15 @@ public class ChronosController {
             @RequestParam(required = false) String snapshotId,
             @RequestParam(required = false) String branchId,
             @RequestParam(required = false) String prefix,
+            @RequestParam(required = false) String validTime,
+            @RequestParam(required = false) String asOfValidTime,
+            @RequestParam(required = false) String asOfTxnTime,
             @RequestParam(defaultValue = "0") int limit,
             @RequestParam(defaultValue = "LINEARIZABLE") String readMode,
             @RequestParam(defaultValue = "false") boolean consistent) {
-        return handleStateReconstruction(mode, versionId, timestamp, snapshotId, branchId, prefix, limit, readMode, consistent);
+        String effectiveVt = (asOfValidTime != null && !asOfValidTime.isBlank()) ? asOfValidTime : validTime;
+        String effectiveTt = (asOfTxnTime != null && !asOfTxnTime.isBlank()) ? asOfTxnTime : timestamp;
+        return handleStateReconstruction(mode, versionId, effectiveTt, snapshotId, branchId, prefix, limit, readMode, consistent, effectiveVt);
     }
 
     @PostMapping("/state")
@@ -417,14 +463,16 @@ public class ChronosController {
         if (mode == null || mode.isBlank()) mode = asString(request.get("mode"));
         String versionId = asString(request.get("versionId"));
         if (versionId == null || versionId.isBlank()) versionId = asString(request.get("asOfVersion"));
-        String timestamp = request.get("timestamp") != null ? String.valueOf(request.get("timestamp")) : null;
+        String timestamp = request.get("timestamp") != null ? String.valueOf(request.get("timestamp")) : asString(request.get("asOfTxnTime"));
         String snapshotId = asString(request.get("snapshotId"));
         String branchId = asString(request.get("branchId"));
         String prefix = asString(request.get("prefix"));
+        String validTime = asString(request.get("validTime"));
+        if (validTime == null || validTime.isBlank()) validTime = asString(request.get("asOfValidTime"));
         int limit = request.get("limit") instanceof Number n ? n.intValue() : 0;
         String readMode = asNonBlankOrDefault(asString(request.get("readMode")), "LINEARIZABLE");
         boolean consistent = Boolean.TRUE.equals(request.get("consistent"));
-        return handleStateReconstruction(mode, versionId, timestamp, snapshotId, branchId, prefix, limit, readMode, consistent);
+        return handleStateReconstruction(mode, versionId, timestamp, snapshotId, branchId, prefix, limit, readMode, consistent, validTime);
     }
 
     private Map<String, Object> handleStateReconstruction(
@@ -436,7 +484,8 @@ public class ChronosController {
             String prefix,
             int limit,
             String readMode,
-            boolean consistent) {
+            boolean consistent,
+            String validTime) {
         if ("AS_OF_SNAPSHOT".equalsIgnoreCase(mode) && snapshotId != null && !raftNode.isLeader()) {
             if (temporalQueryService.getSnapshot(snapshotId).isEmpty()) {
                 Map<String, Object> fwdReq = new LinkedHashMap<>();
@@ -446,6 +495,7 @@ public class ChronosController {
                 fwdReq.put("consistent", consistent);
                 if (branchId != null) fwdReq.put("branchId", branchId);
                 if (prefix != null) fwdReq.put("prefix", prefix);
+                if (validTime != null) fwdReq.put("validTime", validTime);
                 return forwardPostToLeader("/api/chronos/state", fwdReq);
             }
         }
@@ -460,7 +510,10 @@ public class ChronosController {
                 parseReadMode(readMode),
                 consistent,
                 prefix,
-                limit
+                limit,
+                validTime,
+                null,
+                null
         );
 
         DatabaseStateResult state = temporalQueryService.reconstructState(request);
@@ -479,6 +532,9 @@ public class ChronosController {
         resp.put("totalKeys", state.count());
         resp.put("latencyMs", state.latencyMs());
         resp.put("executionTimeMs", (double) state.latencyMs());
+        if (eventBus != null) {
+            eventBus.publish(com.minidb.events.ClusterEvent.kvOperation("GET", prefix != null ? prefix : "state", state.latencyMs(), true));
+        }
         return resp;
     }
 
@@ -780,7 +836,7 @@ public class ChronosController {
         String sourceBranch = asString(request.get("sourceBranch"));
         String targetBranch = asNonBlankOrDefault(asString(request.get("targetBranch")), "main");
         String policyStr = asString(request.get("policy"));
-        MergePolicy policy = policyStr != null ? MergePolicy.valueOf(policyStr.trim().toUpperCase()) : MergePolicy.COMMUTATIVE_DELTA;
+        MergePolicy policy = parseMergePolicy(policyStr);
         @SuppressWarnings("unchecked")
         Map<String, String> customResolutions = (Map<String, String>) request.get("customResolutions");
         String writerId = asString(request.get("writerId"));
@@ -819,7 +875,7 @@ public class ChronosController {
         String sourceBranch = asString(request.get("sourceBranch"));
         String targetBranch = asNonBlankOrDefault(asString(request.get("targetBranch")), "main");
         String policyStr = asString(request.get("policy"));
-        MergePolicy policy = policyStr != null ? MergePolicy.valueOf(policyStr.trim().toUpperCase()) : MergePolicy.COMMUTATIVE_DELTA;
+        MergePolicy policy = parseMergePolicy(policyStr);
         @SuppressWarnings("unchecked")
         Map<String, String> customResolutions = (Map<String, String>) request.get("customResolutions");
         String writerId = asString(request.get("writerId"));
@@ -885,6 +941,59 @@ public class ChronosController {
         resp.put("success", removed);
         resp.put("name", name);
         return ResponseEntity.ok(resp);
+    }
+
+    /**
+     * Retrieve supported CRDT types and policies.
+     */
+    @GetMapping("/crdt/types")
+    public Map<String, Object> getCrdtTypes() {
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("types", List.of("PN_COUNTER", "LWW_REGISTER", "OR_SET", "OR_MAP"));
+        resp.put("policies", List.of("CRDT", "PN_COUNTER", "OR_SET", "LWW_REGISTER", "COMMUTATIVE_DELTA", "LAST_WRITE_WINS", "FAIL_ON_CONFLICT"));
+        return resp;
+    }
+
+    /**
+     * Standalone CRDT resolution endpoint for inspecting and testing conflict-free resolution.
+     */
+    @PostMapping("/crdt/resolve")
+    public ResponseEntity<Map<String, Object>> resolveCrdt(@RequestBody Map<String, Object> req) {
+        String key = asString(req.get("key"));
+        String baseVal = asString(req.get("baseValue"));
+        String leftVal = asString(req.get("leftValue"));
+        String rightVal = asString(req.get("rightValue"));
+        String leftBranch = asNonBlankOrDefault(asString(req.get("leftBranch")), "feature");
+        String rightBranch = asNonBlankOrDefault(asString(req.get("rightBranch")), "main");
+        String policyStr = asString(req.get("policy"));
+        MergePolicy policy = parseMergePolicy(policyStr);
+
+        CrdtResolutionResult result = crdtMergeResolver.resolve(
+                key, baseVal, leftVal, rightVal,
+                leftBranch, rightBranch,
+                System.currentTimeMillis(), System.currentTimeMillis(),
+                1, 2,
+                "writer-left", "writer-right",
+                policy
+        );
+
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("key", key);
+        resp.put("resolvedValue", result.resolvedValue());
+        resp.put("crdtType", result.crdtType().name());
+        resp.put("strategy", result.strategy());
+        resp.put("winningWriter", result.winningWriter());
+        resp.put("explanation", result.explanation());
+        return ResponseEntity.ok(resp);
+    }
+
+    private MergePolicy parseMergePolicy(String raw) {
+        if (raw == null || raw.isBlank()) return MergePolicy.CRDT;
+        try {
+            return MergePolicy.valueOf(raw.trim().toUpperCase().replace("-", "_"));
+        } catch (IllegalArgumentException e) {
+            return MergePolicy.COMMUTATIVE_DELTA;
+        }
     }
 
     /**
@@ -985,8 +1094,11 @@ public class ChronosController {
             case "DELTA" -> OperationType.DELTA;
             default -> OperationType.PUT;
         };
+        Long validFrom = parseOptionalTimestamp(opMap.get("validFrom"));
+        Long validTo = parseOptionalTimestamp(opMap.get("validTo"));
+
         if (opType == OperationType.DELETE) {
-            return ChronosWritePayload.WriteOp.delete(key);
+            return ChronosWritePayload.WriteOp.delete(key, validFrom, validTo);
         }
         if (opType == OperationType.DELTA) {
             Object rawDelta = opMap.get("deltaAmount");
@@ -1005,11 +1117,23 @@ public class ChronosController {
                 long currentNumeric = resolveCurrentNumericValue(key, branchId);
                 resolvedBytes = String.valueOf(currentNumeric + delta).getBytes(StandardCharsets.UTF_8);
             }
-            return ChronosWritePayload.WriteOp.delta(key, resolvedBytes, delta);
+            return ChronosWritePayload.WriteOp.delta(key, resolvedBytes, delta, validFrom, validTo);
         }
         String val = asString(opMap.get("value"));
         byte[] bytes = val != null ? val.getBytes(StandardCharsets.UTF_8) : new byte[0];
-        return ChronosWritePayload.WriteOp.put(key, bytes);
+        return ChronosWritePayload.WriteOp.put(key, bytes, validFrom, validTo);
+    }
+
+    private Long parseOptionalTimestamp(Object obj) {
+        if (obj == null) return null;
+        if (obj instanceof Number num) return num.longValue();
+        String str = obj.toString().trim();
+        if (str.isBlank()) return null;
+        try {
+            return TemporalQueryService.parseTimestamp(str);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private long resolveCurrentNumericValue(String key, String branchId) {
@@ -1113,7 +1237,7 @@ public class ChronosController {
                     .uri(URI.create(leaderUrl + path))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(10))
+                    .timeout(Duration.ofSeconds(30))
                     .build();
             HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             return MAPPER.readValue(response.body(), LinkedHashMap.class);
@@ -1139,7 +1263,7 @@ public class ChronosController {
             HttpRequest httpRequest = HttpRequest.newBuilder()
                     .uri(URI.create(leaderUrl + path))
                     .GET()
-                    .timeout(Duration.ofSeconds(10))
+                    .timeout(Duration.ofSeconds(30))
                     .build();
             HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             return MAPPER.readValue(response.body(), LinkedHashMap.class);

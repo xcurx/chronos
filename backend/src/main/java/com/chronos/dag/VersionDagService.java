@@ -51,7 +51,12 @@ public class VersionDagService {
         if (branchFilter != null && !branchFilter.isBlank()) {
             nodes = versionCatalog.listVersionsByBranch(branchFilter.trim(), limit);
         } else {
-            nodes = versionCatalog.listVersions(limit);
+            if (limit > 0) {
+                nodes = new ArrayList<>(versionCatalog.listVersionsDescending(limit));
+                Collections.reverse(nodes);
+            } else {
+                nodes = versionCatalog.listVersions(limit);
+            }
         }
 
         Set<String> presentNodeIds = new HashSet<>();
@@ -62,7 +67,7 @@ public class VersionDagService {
         List<DagEdge> edges = new ArrayList<>();
         for (ChronosVersion child : nodes) {
             for (String parentId : child.getParentVersionIds()) {
-                if (parentId != null && !parentId.isBlank()) {
+                if (parentId != null && !parentId.isBlank() && presentNodeIds.contains(parentId)) {
                     edges.add(new DagEdge(parentId, child.getVersionId()));
                 }
             }

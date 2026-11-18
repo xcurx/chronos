@@ -1094,23 +1094,29 @@ public class RaftNode {
     private List<ChangeEntry> captureChangeEntries(ChronosWritePayload payload, String branch, List<String> parents) {
         List<ChangeEntry> changes = new ArrayList<>(payload.getOperations().size());
         Map<String, Optional<byte[]>> priorValues = new HashMap<>();
+        long defaultValidFrom = payload.getValidFrom() != null ? payload.getValidFrom() : System.currentTimeMillis();
+        Long defaultValidTo = payload.getValidTo();
+
         for (ChronosWritePayload.WriteOp op : payload.getOperations()) {
             byte[] oldVal = priorValues.computeIfAbsent(
                             op.getKey(),
                             k -> Optional.ofNullable(resolvePriorValueForBranch(k, branch, parents)))
                     .orElse(null);
+            Long vFrom = op.getValidFrom() != null ? op.getValidFrom() : defaultValidFrom;
+            Long vTo = op.getValidTo() != null ? op.getValidTo() : defaultValidTo;
+
             switch (op.getOpType()) {
                 case PUT -> {
-                    changes.add(ChangeEntry.put(op.getKey(), oldVal, op.getValue(), payload.getWriterId()));
+                    changes.add(ChangeEntry.put(op.getKey(), oldVal, op.getValue(), payload.getWriterId(), vFrom, vTo));
                     priorValues.put(op.getKey(), Optional.ofNullable(op.getValue()));
                 }
                 case DELETE -> {
-                    changes.add(ChangeEntry.delete(op.getKey(), oldVal, payload.getWriterId()));
+                    changes.add(ChangeEntry.delete(op.getKey(), oldVal, payload.getWriterId(), vFrom, vTo));
                     priorValues.put(op.getKey(), Optional.empty());
                 }
                 case DELTA -> {
                     long delta = op.getDeltaAmount() != null ? op.getDeltaAmount() : 0L;
-                    changes.add(ChangeEntry.delta(op.getKey(), oldVal, op.getValue(), delta, payload.getWriterId()));
+                    changes.add(ChangeEntry.delta(op.getKey(), oldVal, op.getValue(), delta, payload.getWriterId(), vFrom, vTo));
                     priorValues.put(op.getKey(), Optional.ofNullable(op.getValue()));
                 }
             }

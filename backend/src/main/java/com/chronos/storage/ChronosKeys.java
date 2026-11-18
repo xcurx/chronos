@@ -24,6 +24,8 @@ public final class ChronosKeys {
     public static final String WATERMARK_KEY = "__chronos_meta__:watermark";
     public static final String LAST_SEQ_KEY = "__chronos_meta__:last_seq";
     public static final String ROLLED_BACK_PREFIX = "__chronos_rolledback__:";
+    public static final String BITEMP_PREFIX = "__chronos_bitemp__:";
+    public static final String BITEMP_END = "__chronos_bitemp__;";
 
     public static final byte[] VER_PREFIX_BYTES = utf8(VER_PREFIX);
     public static final byte[] SEQ_PREFIX_BYTES = utf8(SEQ_PREFIX);
@@ -38,6 +40,8 @@ public final class ChronosKeys {
     public static final byte[] BRANCH_END_BYTES = utf8(BRANCH_END);
     public static final byte[] WATERMARK_KEY_BYTES = utf8(WATERMARK_KEY);
     public static final byte[] LAST_SEQ_KEY_BYTES = utf8(LAST_SEQ_KEY);
+    public static final byte[] BITEMP_PREFIX_BYTES = utf8(BITEMP_PREFIX);
+    public static final byte[] BITEMP_END_BYTES = utf8(BITEMP_END);
 
     private ChronosKeys() {}
 
@@ -81,6 +85,20 @@ public final class ChronosKeys {
 
     public static byte[] rolledBackArchiveKey(String versionId, long raftLogIndex) {
         return utf8(ROLLED_BACK_PREFIX + versionId + ":" + raftLogIndex);
+    }
+
+    public static byte[] bitempKey(String key, long validFrom, long validTo, long sequence) {
+        long safeFrom = Math.max(0L, validFrom);
+        long safeTo = Math.max(safeFrom, validTo);
+        return utf8(BITEMP_PREFIX + key + ":" + formatPadded(safeFrom) + ":" + formatPadded(safeTo) + ":" + formatPadded(sequence));
+    }
+
+    public static byte[] bitempPrefixForKey(String key) {
+        return utf8(BITEMP_PREFIX + key + ":");
+    }
+
+    public static byte[] bitempEndForKey(String key) {
+        return utf8(BITEMP_PREFIX + key + ";");
     }
 
     public static String formatPadded(long value) {

@@ -6,6 +6,7 @@ package com.chronos.model;
 public enum ConflictType {
     NONE,
     COMPATIBLE_DELTA,
+    COMPATIBLE_CRDT,
     IDENTICAL_WRITE,
     WRITE_WRITE,
     DELETE_MODIFY,
