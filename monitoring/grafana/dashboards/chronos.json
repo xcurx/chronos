@@ -109,9 +109,9 @@
   "refresh": "5s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["minidb", "raft", "distributed"],
+  "tags": ["chronos", "raft", "distributed", "time-travel"],
   "templating": { "list": [] },
   "time": { "from": "now-15m", "to": "now" },
-  "title": "Mini Distributed Database",
-  "uid": "minidb-dashboard"
+  "title": "Chronos Distributed Database",
+  "uid": "chronos-dashboard"
 }

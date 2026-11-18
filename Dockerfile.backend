@@ -20,12 +20,12 @@ WORKDIR /app
 # RocksDB JNI requires libstdc++ and snappy compression needs libstdc++
 RUN apk add --no-cache libstdc++ libgcc
 
-RUN addgroup -S minidb && adduser -S minidb -G minidb
-RUN mkdir -p /app/data && chown -R minidb:minidb /app
+RUN addgroup -S chronos && adduser -S chronos -G chronos
+RUN mkdir -p /app/data && chown -R chronos:chronos /app
 
 COPY --from=build /app/backend/target/*-boot.jar app.jar
 
-USER minidb
+USER chronos
 
 EXPOSE 8080 9090
 

@@ -1,23 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minidb-ui
-  namespace: minidb
+  name: chronos-ui
+  namespace: chronos
   labels:
-    app: minidb-ui
+    app: chronos-ui
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: minidb-ui
+      app: chronos-ui
   template:
     metadata:
       labels:
-        app: minidb-ui
+        app: chronos-ui
     spec:
       containers:
         - name: ui
-          image: minidb-frontend:latest
+          image: chronos-frontend:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 80
@@ -33,12 +33,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: minidb-ui
-  namespace: minidb
+  name: chronos-ui
+  namespace: chronos
 spec:
   type: NodePort
   selector:
-    app: minidb-ui
+    app: chronos-ui
   ports:
     - port: 80
       targetPort: 80

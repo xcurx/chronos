@@ -1,18 +1,18 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: minidb
-  namespace: minidb
+  name: chronos
+  namespace: chronos
 spec:
-  serviceName: minidb-headless
+  serviceName: chronos-headless
   replicas: 3
   selector:
     matchLabels:
-      app: minidb
+      app: chronos
   template:
     metadata:
       labels:
-        app: minidb
+        app: chronos
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/path: "/actuator/prometheus"
@@ -20,8 +20,8 @@ spec:
     spec:
       terminationGracePeriodSeconds: 30
       containers:
-        - name: minidb
-          image: minidb-backend:latest
+        - name: chronos
+          image: chronos-backend:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -30,7 +30,7 @@ spec:
               name: grpc
           envFrom:
             - configMapRef:
-                name: minidb-config
+                name: chronos-config
           env:
             - name: POD_NAME
               valueFrom:
@@ -39,7 +39,7 @@ spec:
             - name: NODE_ID
               value: "$(POD_NAME)"
             - name: CLUSTER_PEERS
-              value: "minidb-0.minidb-headless.minidb.svc.cluster.local:9090,minidb-1.minidb-headless.minidb.svc.cluster.local:9090,minidb-2.minidb-headless.minidb.svc.cluster.local:9090"
+              value: "chronos-0.chronos-headless.chronos.svc.cluster.local:9090,chronos-1.chronos-headless.chronos.svc.cluster.local:9090,chronos-2.chronos-headless.chronos.svc.cluster.local:9090"
           volumeMounts:
             - name: data
               mountPath: /app/data

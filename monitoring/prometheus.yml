@@ -3,7 +3,7 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: "minidb-cluster"
+  - job_name: "chronos-cluster"
     metrics_path: "/actuator/prometheus"
     static_configs:
       - targets:
@@ -11,4 +11,4 @@ scrape_configs:
           - "node-2:8080"
           - "node-3:8080"
         labels:
-          cluster: "minidb"
+          cluster: "chronos"

@@ -1,20 +1,20 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: minidb
+  name: chronos
 ---
 # Headless Service for StatefulSet DNS
 apiVersion: v1
 kind: Service
 metadata:
-  name: minidb-headless
-  namespace: minidb
+  name: chronos-headless
+  namespace: chronos
   labels:
-    app: minidb
+    app: chronos
 spec:
   clusterIP: None
   selector:
-    app: minidb
+    app: chronos
   ports:
     - name: http
       port: 8080
@@ -27,14 +27,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: minidb-client
-  namespace: minidb
+  name: chronos-client
+  namespace: chronos
   labels:
-    app: minidb
+    app: chronos
 spec:
   type: ClusterIP
   selector:
-    app: minidb
+    app: chronos
   ports:
     - name: http
       port: 8080

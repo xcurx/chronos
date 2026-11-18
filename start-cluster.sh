@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# start-cluster.sh — Start the Mini Distributed Database cluster
+# start-cluster.sh — Start the Chronos Distributed Time-Travel Database cluster
 #
 # Usage:
 #   ./start-cluster.sh              # 3 nodes + dashboard (default)
@@ -57,6 +57,7 @@ NODES=3
 SKIP_BUILD=false
 SKIP_FRONTEND=false
 WITH_DEMO=false
+CLEAN=false
 
 # ── Colors ──────────────────────────────────────────────
 CYAN='\033[0;36m'
@@ -78,9 +79,11 @@ while [[ $# -gt 0 ]]; do
         --skip-build)     SKIP_BUILD=true; shift ;;
         --skip-ui)        SKIP_FRONTEND=true; shift ;;
         --with-demo)      WITH_DEMO=true; shift ;;
+        -c|--clean)       CLEAN=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [-n NODES] [--skip-build] [--skip-ui]"
+            echo "Usage: $0 [-n NODES] [--clean] [--skip-build] [--skip-ui]"
             echo "  -n, --nodes N     Number of nodes (1-5, default: 3)"
+            echo "  -c, --clean       Delete data/ and logs/ before starting (fresh test)"
             echo "  --skip-build      Skip Maven build"
             echo "  --skip-ui         Skip starting the React dashboard"
             echo "  --with-demo       Also start the RaftChat demo app (port 4000)"
@@ -132,6 +135,17 @@ if [[ -f "$PIDFILE" ]]; then
         [[ -n "$fp" ]] && kill -9 $fp 2>/dev/null
     done
     sleep 2
+fi
+
+# Clean up data and logs if --clean was requested
+if [[ "$CLEAN" == true ]]; then
+    step "Cleaning up data and logs for fresh start..."
+    for dir in "$ROOT/logs" "$ROOT/data" "$ROOT/backend/data"; do
+        if [[ -d "$dir" ]]; then
+            rm -rf "$dir"
+            ok "Deleted $dir"
+        fi
+    done
 fi
 
 # Clean up stale RocksDB LOCK files

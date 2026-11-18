@@ -1,7 +1,7 @@
-# Mini Distributed Database - Application Configuration
+# Chronos Distributed Time-Travel Database - Application Configuration
 spring:
   application:
-    name: mini-distributed-db
+    name: chronos-distributed-db
 
 # Server configuration
 server:

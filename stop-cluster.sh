@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# stop-cluster.sh — Stop all Mini Distributed Database processes
+# stop-cluster.sh — Stop all Chronos Distributed Database processes
 #
 # Usage:
 #   ./stop-cluster.sh          # stop all nodes + frontend
@@ -27,7 +27,7 @@ info()  { echo -e "   ${YELLOW}$1${NC}"; }
 
 echo ""
 echo -e "${MAGENTA}  ╔══════════════════════════════════════════╗${NC}"
-echo -e "${MAGENTA}  ║    Mini Distributed Database — Stopper   ║${NC}"
+echo -e "${MAGENTA}  ║   Chronos Distributed Database — Stopper ║${NC}"
 echo -e "${MAGENTA}  ╚══════════════════════════════════════════╝${NC}"
 
 # ── Stop from PID file ──────────────────────────────────
