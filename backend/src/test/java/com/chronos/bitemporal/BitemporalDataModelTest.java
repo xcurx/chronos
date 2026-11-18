@@ -257,4 +257,45 @@ public class BitemporalDataModelTest {
         assertEquals(200L, timeline.get(1).get("validFrom"));
         assertNull(timeline.get(1).get("validTo"));
     }
+
+    @Test
+    void testOpenEndedIntervalsAreClosedWhenSuperseded() {
+        ChronosVersion v1 = ChronosVersion.builder()
+                .versionId("V1")
+                .sequence(catalog.nextSequence())
+                .timestamp(1000L)
+                .status(VersionStatus.COMMITTED)
+                .branchId("main")
+                .changeSet(List.of(
+                        ChangeEntry.put("balance:alice", null, "1000".getBytes(StandardCharsets.UTF_8), "writer1", 1000L, null)
+                ))
+                .build();
+        catalog.saveVersion(v1);
+
+        ChronosVersion v2 = ChronosVersion.builder()
+                .versionId("V2")
+                .sequence(catalog.nextSequence())
+                .parentVersionIds(List.of("V1"))
+                .timestamp(2000L)
+                .status(VersionStatus.COMMITTED)
+                .branchId("main")
+                .changeSet(List.of(
+                        ChangeEntry.put("balance:alice", "1000".getBytes(StandardCharsets.UTF_8), "2000".getBytes(StandardCharsets.UTF_8), "writer2", 2000L, null)
+                ))
+                .build();
+        catalog.saveVersion(v2);
+
+        List<Map<String, Object>> timeline = queryService.getKeyBitemporalTimeline("balance:alice");
+        assertEquals(2, timeline.size());
+
+        // V1 should have its open-ended validTo closed to V2's validFrom (2000L)
+        assertEquals("1000", timeline.get(0).get("value"));
+        assertEquals(1000L, timeline.get(0).get("validFrom"));
+        assertEquals(2000L, timeline.get(0).get("validTo"));
+
+        // V2 is the latest active version, so it remains open-ended
+        assertEquals("2000", timeline.get(1).get("value"));
+        assertEquals(2000L, timeline.get(1).get("validFrom"));
+        assertNull(timeline.get(1).get("validTo"));
+    }
 }

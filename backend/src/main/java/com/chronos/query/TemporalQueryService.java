@@ -588,13 +588,50 @@ public class TemporalQueryService {
                     point.put("branchId", v.getBranchId());
                     point.put("writerId", c.getWriterId() != null ? c.getWriterId() : v.getWriterId());
                     point.put("opType", c.getOpType().name());
-                    point.put("validFrom", c.getValidFrom() != null ? c.getValidFrom() : v.getTimestamp());
+                    long from = c.getValidFrom() != null ? c.getValidFrom() : v.getTimestamp();
+                    point.put("validFrom", from);
                     point.put("validTo", c.getValidTo());
                     point.put("value", c.getNewValueAsString());
                     timeline.add(point);
                 }
             }
         }
+
+        // Sort ascending by sequence / txnTime to establish chronological mutation timeline
+        timeline.sort((a, b) -> {
+            long seqA = a.get("sequence") instanceof Number n ? n.longValue() : 0L;
+            long seqB = b.get("sequence") instanceof Number n ? n.longValue() : 0L;
+            if (seqA != seqB) return Long.compare(seqA, seqB);
+            long txA = a.get("txnTime") instanceof Number n ? n.longValue() : 0L;
+            long txB = b.get("txnTime") instanceof Number n ? n.longValue() : 0L;
+            return Long.compare(txA, txB);
+        });
+
+        // In SQL:2011 / bitemporal data modeling, an open-ended version [Tv_from -> ∞) is superseded
+        // when a subsequent version is written on the same branch at Tv_next. Close the interval to [Tv_from -> Tv_next).
+        for (int i = 0; i < timeline.size() - 1; i++) {
+            Map<String, Object> curr = timeline.get(i);
+            String currBranch = (String) curr.get("branchId");
+            Long currFrom = (Long) curr.get("validFrom");
+            Object currToObj = curr.get("validTo");
+            Long currTo = currToObj instanceof Number n ? n.longValue() : null;
+
+            // Search for the next superseding version on the same branch
+            for (int j = i + 1; j < timeline.size(); j++) {
+                Map<String, Object> next = timeline.get(j);
+                String nextBranch = (String) next.get("branchId");
+                if (currBranch == null || nextBranch == null || currBranch.equals(nextBranch)) {
+                    Long nextFrom = (Long) next.get("validFrom");
+                    if (nextFrom != null && currFrom != null && nextFrom >= currFrom) {
+                        if (currTo == null || currTo > nextFrom || currTo >= 253402300799000L) {
+                            curr.put("validTo", nextFrom);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         return timeline;
     }
 

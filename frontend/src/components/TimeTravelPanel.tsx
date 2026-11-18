@@ -30,11 +30,17 @@ function formatTimestamp(ts?: number | null) {
 }
 
 function formatValidInterval(from?: number | null, to?: number | null) {
+  const formatTimeOrDate = (ts: number) => {
+    const d = new Date(ts);
+    const hasTime = d.getHours() !== 0 || d.getMinutes() !== 0 || d.getSeconds() !== 0;
+    return hasTime ? d.toLocaleString() : d.toLocaleDateString();
+  };
+
   const fromStr = (from !== null && from !== undefined && from > 0)
-    ? new Date(from).toLocaleDateString()
+    ? formatTimeOrDate(from)
     : 'Epoch';
   const toStr = (to !== null && to !== undefined && to < 9223372036854775000 && to < 253402300799000)
-    ? new Date(to).toLocaleDateString()
+    ? formatTimeOrDate(to)
     : '∞';
   return `[${fromStr} → ${toStr})`;
 }
@@ -361,6 +367,27 @@ export default function TimeTravelPanel() {
     }
     return map;
   }, [dbState]);
+
+  // Chronologically sorted timeline with closed superseded intervals
+  const computedTimeline = useMemo(() => {
+    if (!bitemporalTimelineData?.timeline) return [];
+    const list = bitemporalTimelineData.timeline.map((item) => ({ ...item }));
+    list.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0) || (a.txnTime ?? 0) - (b.txnTime ?? 0));
+    for (let i = 0; i < list.length - 1; i++) {
+      const curr = list[i];
+      const next = list[i + 1];
+      if (!curr.branchId || !next.branchId || curr.branchId === next.branchId) {
+        const nextFrom = next.validFrom ?? next.txnTime;
+        const currFrom = curr.validFrom ?? curr.txnTime;
+        if (nextFrom && currFrom && nextFrom >= currFrom) {
+          if (curr.validTo === null || curr.validTo === undefined || curr.validTo > nextFrom || curr.validTo >= 253402300799000) {
+            curr.validTo = nextFrom;
+          }
+        }
+      }
+    }
+    return list;
+  }, [bitemporalTimelineData]);
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-surface-950 p-6 space-y-5">
@@ -691,21 +718,25 @@ export default function TimeTravelPanel() {
                       <div>
                         <div className="flex items-center justify-between mb-1">
                           <label className="text-xs text-purple-400 font-medium flex items-center gap-1">
-                            <Clock className="w-3.5 h-3.5" />
-                            <span>Dimension 2: System Time (Tt)</span>
+                            {bitemporalTtMode === 'VERSION' ? (
+                              <Layers className="w-3.5 h-3.5" />
+                            ) : (
+                              <Clock className="w-3.5 h-3.5" />
+                            )}
+                            <span>Dimension 2: {bitemporalTtMode === 'VERSION' ? 'System Version (Tt)' : 'System Time (Tt)'}</span>
                           </label>
                           <div className="flex items-center gap-1 text-[10px]">
                             <button
                               type="button"
                               onClick={() => setBitemporalTtMode('VERSION')}
-                              className={`px-1.5 py-0.5 rounded ${bitemporalTtMode === 'VERSION' ? 'bg-purple-600 text-white' : 'text-white/40'}`}
+                              className={`px-1.5 py-0.5 rounded transition ${bitemporalTtMode === 'VERSION' ? 'bg-purple-600 text-white font-semibold' : 'text-white/40 hover:text-white/70'}`}
                             >
                               Ver
                             </button>
                             <button
                               type="button"
                               onClick={() => setBitemporalTtMode('TIME')}
-                              className={`px-1.5 py-0.5 rounded ${bitemporalTtMode === 'TIME' ? 'bg-purple-600 text-white' : 'text-white/40'}`}
+                              className={`px-1.5 py-0.5 rounded transition ${bitemporalTtMode === 'TIME' ? 'bg-purple-600 text-white font-semibold' : 'text-white/40 hover:text-white/70'}`}
                             >
                               Time
                             </button>
@@ -734,7 +765,7 @@ export default function TimeTravelPanel() {
                       </div>
                     </div>
                     <div className="text-[11px] text-white/40 bg-white/[0.02] p-2 rounded-lg border border-white/[0.04]">
-                      2D Intersection: Reconstructs state effective at valid-time <strong className="text-emerald-300">Tv</strong> as was recorded up to system commit <strong className="text-purple-300">Tt</strong>.
+                      2D Intersection: Reconstructs state effective at valid-time <strong className="text-emerald-300">Tv</strong> as was recorded up to system commit {bitemporalTtMode === 'VERSION' ? 'version' : 'time'} <strong className="text-purple-300">Tt</strong>.
                     </div>
                   </div>
                 )}
@@ -947,13 +978,13 @@ export default function TimeTravelPanel() {
                   <div>
                     <h3 className="text-sm font-bold text-white font-mono">{bitemporalTimelineData.key}</h3>
                     <p className="text-xs text-white/50">
-                      2D Bitemporal Interval Mapping ({bitemporalTimelineData.timeline.length} recorded versions)
+                      2D Bitemporal Interval Mapping ({computedTimeline.length} recorded versions)
                     </p>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-1 gap-3">
-                  {bitemporalTimelineData.timeline.map((item, idx) => (
+                  {computedTimeline.map((item, idx) => (
                     <div
                       key={idx}
                       className="bg-surface-950 border border-white/[0.06] rounded-xl p-4 text-xs space-y-2 hover:border-emerald-500/30 transition"
@@ -990,7 +1021,7 @@ export default function TimeTravelPanel() {
                       </div>
                     </div>
                   ))}
-                  {bitemporalTimelineData.timeline.length === 0 && (
+                  {computedTimeline.length === 0 && (
                     <div className="py-6 text-center text-white/40 text-xs">
                       No mutations recorded for key {bitemporalTimelineData.key}.
                     </div>
@@ -1233,8 +1264,8 @@ export default function TimeTravelPanel() {
                     <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
                     <span>Loading timeline...</span>
                   </div>
-                ) : bitemporalTimelineData?.timeline?.length ? (
-                  bitemporalTimelineData.timeline.map((point, i) => (
+                ) : computedTimeline.length ? (
+                  computedTimeline.map((point, i) => (
                     <div
                       key={i}
                       className="bg-surface-950 border border-white/[0.06] rounded-xl p-3.5 text-xs space-y-2"
