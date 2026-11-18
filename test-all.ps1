@@ -1,5 +1,5 @@
-###############################################################################
-# Mini Distributed Database - Complete Test & Benchmark Script
+﻿###############################################################################
+# Chronos Distributed Database - Complete Test & Benchmark Script
 # Run from: C:\Users\vedan\Mini-Distributed-Database - Copy
 # Prerequisites: Docker cluster running (docker compose up --build -d)
 ###############################################################################

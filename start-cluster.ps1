@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Start the Mini Distributed Database cluster (3 nodes + React dashboard + demo app).
+    Start the Chronos Distributed Time-Travel Database cluster (3 nodes + React dashboard + demo app).
 
 .DESCRIPTION
     Builds the backend (if needed), starts 3 Raft nodes as background processes,
@@ -50,7 +50,7 @@ function Write-Info($msg)  { Write-Host "   $msg" -ForegroundColor Yellow }
 # --- Banner ---
 Write-Host ""
 Write-Host "  +==========================================+" -ForegroundColor Magenta
-Write-Host "  |   Mini Distributed Database - Launcher   |" -ForegroundColor Magenta
+Write-Host "  |  Chronos Distributed Database - Launcher |" -ForegroundColor Magenta
 Write-Host "  +==========================================+" -ForegroundColor Magenta
 Write-Host ""
 

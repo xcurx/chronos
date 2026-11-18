@@ -14,7 +14,7 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Basic unit tests for the Mini Distributed Database.
+ * Basic unit tests for the Chronos Distributed Time-Travel Database.
  */
 class MiniDbApplicationTests {
 

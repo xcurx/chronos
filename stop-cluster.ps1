@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Stop all Mini Distributed Database cluster processes.
+    Stop all Chronos Distributed Time-Travel Database cluster processes.
 
 .DESCRIPTION
     Reads saved PIDs from .cluster-pids and gracefully stops all
@@ -28,7 +28,7 @@ function Write-Info($msg)  { Write-Host "   $msg" -ForegroundColor Yellow }
 
 Write-Host ""
 Write-Host "  +==========================================+" -ForegroundColor Magenta
-Write-Host "  |    Mini Distributed Database - Stopper   |" -ForegroundColor Magenta
+Write-Host "  |   Chronos Distributed Database - Stopper |" -ForegroundColor Magenta
 Write-Host "  +==========================================+" -ForegroundColor Magenta
 
 # --- Stop processes from PID file ---

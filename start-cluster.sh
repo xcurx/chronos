@@ -115,7 +115,7 @@ get_peers() {
 # ── Banner ──────────────────────────────────────────────
 echo ""
 echo -e "${MAGENTA}  ╔══════════════════════════════════════════╗${NC}"
-echo -e "${MAGENTA}  ║   Mini Distributed Database — Launcher   ║${NC}"
+echo -e "${MAGENTA}  ║  Chronos Distributed Database — Launcher ║${NC}"
 echo -e "${MAGENTA}  ╚══════════════════════════════════════════╝${NC}"
 echo ""
 
